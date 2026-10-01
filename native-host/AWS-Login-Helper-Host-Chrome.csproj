@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      Hyphenated, spelled-out on purpose: this is the literal .exe filename end users (and
+      whoever's diagnosing something in Task Manager's Details tab, which shows the image
+      file name, not a friendly display name) will see - "AwsLoginHelperHost.exe" reads as one
+      run-together word at a glance. RootNamespace below is deliberately left alone: C#
+      namespaces can't contain hyphens, and every .cs file already declares its own explicit
+      "namespace AwsLoginHelperHost { ... }" rather than relying on this value, so it's pure
+      internal metadata with no user-visible effect either way.
+    -->
+    <AssemblyName>AWS-Login-Helper-Host-Chrome</AssemblyName>
+    <RootNamespace>AwsLoginHelperHost</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+
+    <!--
+      Without these, .NET defaults every assembly's file/product version to 1.0.0.0
+      regardless of Program.Version, which is why Explorer's own Properties dialog on the
+      published exe kept showing 1.0.0 even after that constant was bumped - that constant
+      only controls what OUR OWN code (the version CLI flag, the ping response) reports, not
+      the assembly metadata Windows itself reads. Keep this in sync with Program.Version by
+      hand whenever one changes.
+    -->
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
+
+    <!--
+      This app is meant to run on a Windows PC with no admin rights and no requirement to
+      pre-install any .NET runtime. Publishing self-contained + single-file bakes the runtime
+      into one .exe, so "no admin, just run it" holds for end users. Build with:
+        dotnet publish -c Release
+      (RuntimeIdentifier/SelfContained/PublishSingleFile below make that the default; no extra
+      flags needed.)
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Microsoft.Win32.Registry" Version="5.0.0" />
+  </ItemGroup>
+
+</Project>
