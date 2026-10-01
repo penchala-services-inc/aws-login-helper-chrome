@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AWS Login Helper - Get Started</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 620px;
+      margin: 48px auto;
+      padding: 0 24px;
+      color: #232f3e;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    h1 { font-size: 22px; margin-bottom: 4px; }
+    .subtitle { color: #545b64; margin-top: 0; }
+    .step {
+      display: flex;
+      gap: 14px;
+      margin: 28px 0;
+      padding: 16px;
+      border: 1px solid #e1e4e8;
+      border-radius: 8px;
+    }
+    .step.done { opacity: 0.6; }
+    .step-num {
+      flex: 0 0 auto;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #0972d3;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 14px;
+    }
+    .step-body h2 { font-size: 16px; margin: 0 0 6px; }
+    .step-body p { margin: 0 0 12px; color: #414750; }
+    .button {
+      display: inline-block;
+      padding: 10px 18px;
+      background: #ec7211;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 4px;
+      font-weight: bold;
+      font-size: 14px;
+    }
+    .secondary-link { font-size: 13px; }
+    .trust-box {
+      margin: 28px 0;
+      padding: 16px 18px;
+      background: #f0faf0;
+      border: 1px solid #c3e6c3;
+      border-radius: 8px;
+    }
+    .trust-box h2 { font-size: 15px; margin: 0 0 6px; color: #1d8102; }
+    .trust-box p { margin: 0 0 8px; color: #414750; font-size: 13.5px; }
+    .trust-box p:last-child { margin-bottom: 0; }
+    .trust-box a { color: #0972d3; }
+    footer { margin-top: 36px; font-size: 12px; color: #8a919b; }
+  </style>
+</head>
+<body>
+  <h1>AWS Login Helper is installed</h1>
+  <p class="subtitle">One more step before you can open isolated account/role windows.</p>
+
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <h2>Install the companion app</h2>
+      <p>
+        A small, per-user Windows program does the actual work of opening each
+        AWS account/role in its own isolated window - no admin rights needed,
+        no UAC prompt.
+      </p>
+      <a class="button"
+         href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest"
+         target="_blank" rel="noopener noreferrer">Download companion app</a>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <h2>Sign in and try it</h2>
+      <p>
+        Sign into your AWS IAM Identity Center (SSO / IIC) access portal as
+        usual. Every account/role on your list will have an "Isolated
+        (Window)" link next to it.
+      </p>
+    </div>
+  </div>
+
+  <div class="trust-box">
+    <h2>Open source, nothing hidden</h2>
+    <p>
+      The companion app's entire source code is right there in this
+      project's repo, under <code>native-host/</code> - it isn't a separate,
+      closed-source download from somewhere else. All it does is launch a
+      separate, dedicated Chrome window for each AWS account/role and copy
+      your AWS SSO session cookie into it, so you don't have to sign in
+      again. No telemetry, no data sent anywhere other than AWS itself.
+    </p>
+    <p>
+      You're welcome to read every line yourself before installing it:
+      <a href="https://github.com/penchala-services-inc/aws-login-helper-chrome"
+         target="_blank" rel="noopener noreferrer">view the source on GitHub</a>.
+    </p>
+  </div>
+
+  <p class="secondary-link">
+    Already installed the companion app? Open the extension's
+    <a href="options.html">options page</a> and click "Check companion app"
+    to confirm it's connected.
+  </p>
+
+  <footer>AWS Login Helper - not affiliated with Amazon Web Services, Inc.</footer>
+</body>
+</html>

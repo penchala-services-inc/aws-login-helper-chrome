@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AWS Login Helper</title>
+  <style>
+    body { font-family: Arial, sans-serif; width: 340px; padding: 12px; font-size: 13px; }
+    h3 { margin: 0; font-size: 15px; }
+    h4 { margin: 0 0 8px; font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: .04em; }
+    .title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .title-row a { font-size: 12px; white-space: nowrap; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 14px 0; }
+    section { margin: 0; }
+    label { display: block; margin: 10px 0 4px; font-weight: bold; }
+    select, input[type="text"] { width: 100%; box-sizing: border-box; padding: 4px; }
+    .row { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+    #status { margin-top: 14px; padding: 8px; border-radius: 4px; font-size: 12px; }
+    #status:empty { display: none; }
+    .ok { background: #e6f4ea; color: #137333; }
+    .err { background: #fce8e6; color: #c5221f; }
+    ul#profiles { list-style: none; max-height: 220px; overflow-y: auto; padding-left: 0; margin: 6px 0; }
+    button { padding: 6px 10px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="title-row">
+    <h3>AWS Login Helper</h3>
+    <a href="https://chromewebstore.google.com/detail/lbnopneedeeomcfebahnkankbedjjlfk/reviews" target="_blank" rel="noopener noreferrer">Rate the extension</a>
+  </div>
+
+  <hr />
+
+  <section>
+    <h4>Options</h4>
+
+    <label for="default-region">Default console region</label>
+    <input type="text" id="default-region" placeholder="us-east-2" />
+
+    <div class="row">
+      <input type="checkbox" id="enable-debug" />
+      <label for="enable-debug" style="margin:0;">Enable debug logging</label>
+    </div>
+
+    <div class="row">
+      <button id="save">Save</button>
+    </div>
+  </section>
+
+  <hr />
+
+  <section>
+    <h4>Companion App</h4>
+
+    <div class="row">
+      <button id="check-host">Check companion app</button>
+    </div>
+    <div class="row">
+      <a href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest" target="_blank" rel="noopener noreferrer">Download companion app</a>
+    </div>
+  </section>
+
+  <hr />
+
+  <section>
+    <h4>Isolated AWS Profiles</h4>
+
+    <div class="row">
+      <button id="list-profiles">Show profiles</button>
+    </div>
+    <ul id="profiles"><li>(click "Show profiles")</li></ul>
+    <div class="row">
+      <input type="checkbox" id="select-all-profiles" />
+      <label for="select-all-profiles" style="margin:0;">Select all</label>
+      <button id="delete-selected-profiles">Delete selected</button>
+    </div>
+  </section>
+
+  <div id="status"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>
