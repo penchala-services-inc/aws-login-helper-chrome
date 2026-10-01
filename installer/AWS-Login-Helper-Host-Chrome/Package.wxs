@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user MSI for the AWS Login Helper native messaging host.
+
+  Scope="perUser" is the whole point: it installs under the current user's
+  %LocalAppData% and writes only HKEY_CURRENT_USER registry values, so this MSI
+  runs (and can be double-clicked) with NO administrator rights at all.
+
+  This installer does NOT install the Chrome extension itself - Chrome extensions
+  are distributed through the Chrome Web Store, not MSI. The RegisterNativeHost
+  custom action below opens the Web Store listing for the user if the extension
+  isn't already installed (see native-host/Registration.cs, the check extension flag).
+
+  NO LONGER ships a copy of extension/ under EXTENSIONFOLDER - a previous design
+  (see ChromeManager.cs's own top-of-file doc comment for the full history) loaded that
+  copy unpacked, via the load-extension command-line switch, into the dedicated per-account
+  Chrome instance. Google removed that switch ENTIRELY starting in Chrome 137
+  (June 2025), so that copy stopped doing anything at all - confirmed dead via real testing,
+  not just a theoretical deprecation. The account/role banner is shown via CDP script
+  injection now (see CdpClient.SetCookiesAndNavigateAsync), which needs no extension loaded
+  into that dedicated instance whatsoever. The EXTENSIONID property and RegisterNativeHost
+  custom action below are UNRELATED to that dead mechanism - they're the real Chrome Web
+  Store native-messaging registration (native-messaging-host.json's allowed_origins), still
+  fully needed for the extension the user installs in their OWN everyday Chrome profile.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package Name="AWS Login Helper Chrome"
+            Manufacturer="Penchala Services Inc"
+            Version="1.0.0"
+            UpgradeCode="54b84f5f-1613-4a87-862b-1e592ed6d896"
+            Scope="perUser">
+
+    <!--
+      Name (above) is what actually shows up in Windows' "Programs and Features" / "Apps &
+      features" list in Control Panel/Settings - it's a completely separate thing from the
+      built .exe's AssemblyName or the built .msi's own OutputName (see AWS-Login-Helper-Host-
+      Chrome.csproj/.wixproj), both of which only control filenames on disk, never anything
+      Control Panel reads. If this still shows an old name after installing a rebuilt MSI,
+      the old product wasn't actually replaced - see AllowSameVersionUpgrades below.
+
+      AllowSameVersionUpgrades="yes": this project deliberately keeps Version pinned at 1.0.0
+      across rebuilds (see Program.cs), but WiX's MajorUpgrade, by default, treats installing
+      the SAME version over itself as a downgrade and blocks it outright - which would mean a
+      rebuilt MSI (with this new Name, or any other change) would silently refuse to replace
+      the old install, leaving the stale product (old name, old files) in Control Panel no
+      matter how many times it's reinstalled. This flag tells MajorUpgrade to go ahead and
+      replace an equal-version install too, so every rebuild actually takes effect.
+    -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the AWS Login Helper native host is already installed."
+                  AllowSameVersionUpgrades="yes" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      All-uppercase Id makes this a PUBLIC property - settable from the command line
+      (msiexec /i AWS-Login-Helper-Host-Chrome.msi EXTENSIONID=<id>) and readable by the immediate
+      CustomAction below in this same session. Defaults to whatever extension-id.txt already
+      ships with (see native-host/extension-id.txt) - update this default once the extension
+      is actually published to the Chrome Web Store. Anyone installing locally against an
+      unpacked/dev-loaded copy of the extension (which gets its own, different, machine/path-
+      specific id) can supply their own id here instead of hand-editing extension-id.txt
+      themselves; RegisterNativeHost passes whatever this resolves to straight through to the
+      register command, which ADDS it to extension-id.txt alongside whatever ids are already
+      there (see GetConfiguredExtensionIds in Registration.cs) rather than replacing them - so
+      a local override never breaks the published extension on that same machine, and any
+      number of allowed ids end up in the native messaging manifest's allowed_origins list.
+    -->
+    <Property Id="EXTENSIONID" Value="kokhkaogcgallbcfmfneadokgjhmpabb" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="AWS-Login-Helper-Host-Chrome">
+        <Directory Id="HOSTFOLDER" Name="NativeHost" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="AWS Login Helper Chrome" Level="1">
+      <ComponentGroupRef Id="NativeHostComponents" />
+    </Feature>
+
+    <!--
+      Runs once, right after files land, as the signed-in user (no elevation - the whole
+      package is per-user). It writes native-messaging-host.json next to the exe with the
+      exe's own resolved path baked in, points Chrome at it via HKCU, and checks whether the
+      companion Chrome extension is installed - offering the Web Store listing if not.
+      See native-host/Registration.cs for what the register flag actually does.
+
+      Execute="deferred" (NOT "immediate") is required here. "After=InstallFiles" only
+      controls this action's position in the SEQUENCE TABLE - it does not mean the files are
+      actually on disk yet. InstallFiles itself, when it runs in the immediate pass, merely
+      QUEUES the real file-copy operations into a deferred script; that script only actually
+      runs later, inside InstallFinalize. An "immediate" custom action runs synchronously
+      during the immediate pass, i.e. before that deferred script (and therefore before the
+      real file copy) has executed at all - so it was trying to launch an .exe that did not
+      exist on disk yet, failing with MSI error 1721, which "Return=ignore" then silently
+      swallowed (confirmed via verbose /l*v logging: RegisterNativeHost ran and failed at
+      11:26:04:013, while AWS-Login-Helper-Host-Chrome.exe wasn't actually copied until 11:26:04:124).
+      "Execute=deferred" instead adds this action INTO that same deferred script, so it
+      actually runs after the real file copy, in sequence-table order, still before the
+      install finishes. [EXTENSIONID] is still resolved correctly: MSI formats a deferred
+      CustomAction's ExeCommand using the current property values at SCHEDULING time (during
+      the immediate pass) and bakes the resolved literal string into the deferred script, so
+      no CustomActionData plumbing is needed just to pass this one property through.
+    -->
+    <CustomAction Id="RegisterNativeHost"
+                  FileRef="NativeHostExeFile"
+                  ExeCommand="--register &quot;[EXTENSIONID]&quot;"
+                  Execute="deferred"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RegisterNativeHost" After="InstallFiles" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="NativeHostComponents" Directory="HOSTFOLDER">
+
+      <!--
+        MSI's ICE38 validation rule requires that any component installing into a
+        per-user ("user profile") directory use an HKCU registry value as its KeyPath,
+        not a file - a plain file KeyPath is only valid for per-machine installs. So
+        every component below carries its own small HKCU marker value as the real
+        KeyPath, with the file(s) it installs marked KeyPath="no". ICE64 additionally
+        requires every per-user directory to be explicitly removed on uninstall via
+        RemoveFolder, since MSI won't infer that the way it does under Program Files.
+      -->
+
+      <!--
+        Explicit (not "*") Guid: WiX's automatic per-component Guid generation only
+        works for components with a single keyed resource. These components
+        intentionally mix a File with an HKCU RegistryValue keypath (required by
+        ICE38 above), so each needs its own fixed Guid instead.
+
+        NativeHostExeComponent below is the one exception to what follows: its Guid
+        really is meant to stay fixed forever, because the .exe it ships has a genuine
+        PE version resource (from the .csproj's FileVersion), so Windows Installer's
+        ordinary "higher version always wins" file-overwrite rule already applies to it
+        without any extra help - regenerating its Guid would only risk breaking
+        upgrade/uninstall for no benefit.
+
+        ExtensionIdFileComponent is different: it ships a plain text file with no PE version
+        resource at all. WiX v4 has no File/@Version (or any per-file) attribute to fake one - unlike
+        WiX v3, the File element doesn't accept it (confirmed: WIX0004 "unexpected attribute
+        'Version'" is a hard compiler error in v4, not a warning). Without SOME way to tell
+        Windows Installer "this is newer", its default rule for an unversioned file is to
+        leave whatever's already on disk alone during an upgrade whenever the owning
+        Component's Guid stays the same across versions - which is exactly what shipped a
+        stale extension-id.txt (and would have shipped stale extension files) despite the
+        rebuilt source being correct.
+
+        The fix that actually works in WiX v4: give each of THOSE components a brand new
+        Guid every time its file's content changes (see the Guid values below, and the
+        matching bump in each ComponentGroup's own intro comment). A different Guid is a
+        different resource as far as Windows Installer's component reference-counting is
+        concerned, so under this project's MajorUpgrade (which fully removes the old
+        ProductCode and installs the new one, not an in-place component-level patch), the
+        old file is removed and the new one is installed fresh - regardless of any file
+        version metadata. This is safe specifically because MajorUpgrade does a full
+        product replace; it would NOT be safe for a Component shared across a minor
+        upgrade/patch of the SAME ProductCode, which this project doesn't use.
+      -->
+      <Component Id="NativeHostExeComponent" Guid="4eba54eb-0100-4b5c-9c9b-730919e2933d">
+        <File Id="NativeHostExeFile"
+              Source="..\..\native-host\bin\Release\net8.0\win-x64\publish\AWS-Login-Helper-Host-Chrome.exe"
+              KeyPath="no" />
+        <RegistryValue Root="HKCU"
+                        Key="Software\AwsLoginHelperNative"
+                        Name="NativeHostInstalled"
+                        Value="1"
+                        Type="string"
+                        KeyPath="yes" />
+        <RemoveFolder Id="RemoveHostFolder" Directory="HOSTFOLDER" On="uninstall" />
+      </Component>
+
+      <!--
+        Ships extension-id.txt, which RegisterNativeHost (below) actually reads at install
+        time - so whatever id this file has at BUILD time is what gets registered. This
+        Component's Guid gets a fresh value every time extension-id.txt's content changes
+        (see the long comment above this ComponentGroup for why that, not a Version
+        attribute, is the real fix) - bump it again next time this file changes, alongside
+        the MSI version. For a one-off fix without a rebuild, edit the deployed copy under
+        %LocalAppData% directly and re-run AWS-Login-Helper-Host-Chrome.exe with the register flag by
+        hand instead.
+      -->
+      <Component Id="ExtensionIdFileComponent" Guid="10623d90-ee68-4853-9878-988c1bd40997">
+        <File Id="ExtensionIdFile"
+              Source="..\..\native-host\extension-id.txt"
+              KeyPath="no" />
+        <RegistryValue Root="HKCU"
+                        Key="Software\AwsLoginHelperNative"
+                        Name="ExtensionIdFileInstalled"
+                        Value="1"
+                        Type="string"
+                        KeyPath="yes" />
+      </Component>
+
+      <!--
+        Chrome's own documented per-user native messaging host registration:
+        https://developer.chrome.com/docs/apps/nativeMessaging#native-messaging-host
+        The value is written by MSI at install time; the file it points at is written by
+        RegisterNativeHost above (MSI can't template JSON, the exe can). This registry
+        value is already an HKCU value, so it can be its own component's KeyPath - no
+        extra marker needed here. It also carries the RemoveFolder for the parent
+        INSTALLFOLDER, so the top-level AWS-Login-Helper-Host-Chrome folder is cleaned up too.
+      -->
+      <Component Id="NativeMessagingRegistryComponent" Guid="*">
+        <RegistryValue Root="HKCU"
+                        Key="Software\Google\Chrome\NativeMessagingHosts\com.penchala_services_inc.awsloginhelper"
+                        Value="[HOSTFOLDER]native-messaging-host.json"
+                        Type="string"
+                        KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+
+</Wix>

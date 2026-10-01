@@ -1,0 +1,20 @@
+<Project Sdk="WixToolset.Sdk/4.0.5">
+
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <!-- Hyphenated so the built .msi's own filename reads clearly, e.g. in Downloads or a
+         software-deployment tool's package list, same reasoning as the native host's own
+         AssemblyName in AWS-Login-Helper-Host-Chrome.csproj. -->
+    <OutputName>AWS-Login-Helper-Host-Chrome</OutputName>
+  </PropertyGroup>
+
+  <!--
+    NOTE: WixToolset.Sdk auto-includes every *.wxs file in this project directory,
+    the same way Microsoft.NET.Sdk auto-includes *.cs files. Do NOT also add an
+    explicit <Compile Include="Package.wxs" /> item here - that double-includes
+    the file and causes "Duplicate symbol" / "Multiple entry sections" errors at
+    build time (every Product-level property and every Component/File/CustomAction
+    Id gets defined twice).
+  -->
+
+</Project>
