@@ -27,7 +27,7 @@
 
   <Package Name="AWS Login Helper Chrome"
             Manufacturer="Penchala Services Inc"
-            Version="1.0.0"
+            Version="1.0.2"
             UpgradeCode="54b84f5f-1613-4a87-862b-1e592ed6d896"
             Scope="perUser">
 
@@ -39,9 +39,10 @@
       Control Panel reads. If this still shows an old name after installing a rebuilt MSI,
       the old product wasn't actually replaced - see AllowSameVersionUpgrades below.
 
-      AllowSameVersionUpgrades="yes": this project deliberately keeps Version pinned at 1.0.0
-      across rebuilds (see Program.cs), but WiX's MajorUpgrade, by default, treats installing
-      the SAME version over itself as a downgrade and blocks it outright - which would mean a
+      AllowSameVersionUpgrades="yes": a rebuild doesn't always bump this Version (see
+      Program.cs's own Version constant, which this is kept in sync with by hand), but WiX's
+      MajorUpgrade, by default, treats installing the SAME version over itself as a downgrade
+      and blocks it outright - which would mean a
       rebuilt MSI (with this new Name, or any other change) would silently refuse to replace
       the old install, leaving the stale product (old name, old files) in Control Panel no
       matter how many times it's reinstalled. This flag tells MajorUpgrade to go ahead and
@@ -65,7 +66,7 @@
       a local override never breaks the published extension on that same machine, and any
       number of allowed ids end up in the native messaging manifest's allowed_origins list.
     -->
-    <Property Id="EXTENSIONID" Value="kokhkaogcgallbcfmfneadokgjhmpabb" />
+    <Property Id="EXTENSIONID" Value="cpjgfffnippggeadnapfeggfifkmomag" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="INSTALLFOLDER" Name="AWS-Login-Helper-Host-Chrome">

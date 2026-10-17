@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "AWS Login Helper",
-  "description": "Log into AWS IAM Identity Center once, open any account/role in its own isolated Chrome profile window without re-authenticating.",
-  "version": "1.0.0",
+  "name": "AWS Login Helper - SSO Multi Session",
+  "description": "Sign into AWS SSO / IIC (IAM Identity Center) once to open any account role in an isolated Chrome window without re-authenticating.",
+  "version": "1.0.2",
   "homepage_url": "https://github.com/penchala-services-inc/aws-login-helper-chrome",
   "author": "Penchala Services Inc",
-  
+
   "permissions": ["cookies", "storage", "tabs", "nativeMessaging", "alarms"],
   "host_permissions": [
     "*://*.awsapps.com/*",

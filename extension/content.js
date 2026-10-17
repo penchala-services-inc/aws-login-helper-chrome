@@ -15,11 +15,10 @@ const linksInfo = new Set();
 const AWS_CONSOLE_URL = 'console.aws.amazon.com/';
 const AWS_APPS_START_URL = '.awsapps.com/start/#/';
 const AWS_CONSOLE_DEFAULT_REGION = 'us-east-2';
-const COMPANION_APP_DOWNLOAD_URL = 'https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest';
 
-// Real, published Chrome Web Store id (lbnopneedeeomcfebahnkankbedjjlfk) - the /reviews
+// Real, published Chrome Web Store id (cpjgfffnippggeadnapfeggfifkmomag) - the /reviews
 // suffix takes the user straight to "write a review" instead of the listing's main tab.
-const EXTENSION_REVIEW_URL = 'https://chromewebstore.google.com/detail/lbnopneedeeomcfebahnkankbedjjlfk/reviews';
+const EXTENSION_REVIEW_URL = 'https://chromewebstore.google.com/detail/aws-login-helper/cpjgfffnippggeadnapfeggfifkmomag/reviews';
 
 let accountInfo = { accountAlias: null, accountId: null };
 
@@ -53,6 +52,54 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 function log(...args) {
   if (IsDebug) console.log('[AWSLoginHelper]', ...args);
+}
+
+// ROOT CAUSE of "clicking a Recent Logins & Services link does nothing" (confirmed: works
+// fine in the original Firefox extension, broken the same way in both the Chrome and Edge
+// ports): Firefox's background.js is a classic persistent (manifest v2) background page -
+// it is never torn down, so a message sent to it always finds it awake. This extension's
+// background.js is an MV3 service worker (see manifest.json), which Chrome deliberately
+// suspends after ~30s of inactivity and has to respawn on the next event. Respawning is
+// supposed to be transparent, but there is a well-known timing window right as the worker
+// is coming back up where chrome.runtime.sendMessage's delivery to it fails outright
+// ("Could not establish connection. Receiving end does not exist.") - and EVERY
+// 'openAccountRole' call in this file was fire-and-forget, with no callback at all, so
+// that failure had nowhere to go: no console error, no retry, no isolated window, nothing.
+// The MAIN account-list link rarely hits this because it's usually clicked soon after the
+// page loads, while background.js's own prewarm (triggered right at the top of this file)
+// still has the service worker freshly awake. A "Recent Login" is, by its nature, often
+// clicked well after the page has been sitting open - exactly when the worker is more
+// likely to have gone idle. sendNative()'s own native-messaging connection (background.js)
+// already reconnects transparently; this is the one missing layer, one level up, between
+// content.js and background.js itself.
+function sendOpenAccountRoleMessage(payload, attempt = 1) {
+  chrome.runtime.sendMessage(payload, (response) => {
+    if (chrome.runtime.lastError) {
+      const detail = chrome.runtime.lastError.message;
+      if (attempt === 1) {
+        log('openAccountRole message failed, retrying once:', detail);
+        // Long enough for a cold service worker to finish respawning and register its
+        // onMessage listener, short enough that the user never notices the delay.
+        setTimeout(() => sendOpenAccountRoleMessage(payload, 2), 300);
+      } else {
+        console.error('AWS Login Helper: openAccountRole message failed after retry:', detail);
+      }
+      return;
+    }
+
+    // The message was DELIVERED fine (no lastError above) but that only proves background.js
+    // received it - background.js's own 'openAccountRole' handler can still fail downstream
+    // (e.g. the native host call itself) and report ok:false, which this callback was
+    // previously never even given the chance to notice (the original code passed no callback
+    // at all, and this one only checked lastError). That failure already gets logged with
+    // console.error('Native host reported failure: ...') - but inside the BACKGROUND SERVICE
+    // WORKER's own console (chrome://extensions -> Details -> "Inspect views: service
+    // worker"), not this page's console, which is easy to miss and looks identical to the
+    // link silently doing nothing. Logging it here too, on the page actually being clicked.
+    if (!response || response.ok !== true) {
+      console.error('AWS Login Helper: openAccountRole was delivered but failed:', response);
+    }
+  });
 }
 
 // Open the native messaging connection now, on ANY *.awsapps.com page - not just once the
@@ -119,12 +166,22 @@ async function createLinksFromStorageEntries() {
     const { recentfivelogins: recentEntries = [] } = await chrome.storage.local.get('recentfivelogins');
     const { recentServicesByAccount = {} } = await chrome.storage.local.get('recentServicesByAccount');
 
+    // Was previously "if a container already exists, leave it alone forever" - meaning this
+    // list was rendered exactly ONCE per page load and never again, even though the storage
+    // behind it keeps changing all session long: every click of an "Isolated (Window)"/Console
+    // link bumps recentfivelogins' order, and the native host's own service-visited push (see
+    // background.js's nativePort.onMessage handler) writes into recentServicesByAccount from
+    // entirely outside any click on this page at all. Removing any existing container and
+    // rebuilding from the current storage values every time this runs - cheap, only ever 5
+    // entries - is what actually lets scheduleStorageRerender below (registered once, near the
+    // bottom of this file) make the visible list track storage instead of a one-time snapshot
+    // of whatever it happened to contain when the portal page first loaded.
+    const existingContainer = document.querySelector('.recent-logins-container');
+    if (existingContainer) existingContainer.remove();
+
     if (recentEntries.length === 0) return;
 
-    let parentContainer = document.querySelector('.recent-logins-container');
-    if (parentContainer) return; // already rendered
-
-    parentContainer = document.createElement('div');
+    let parentContainer = document.createElement('div');
     parentContainer.className = 'recent-logins-container';
     document.body.prepend(parentContainer);
     parentContainer.style.display = 'flex';
@@ -176,7 +233,7 @@ async function createLinksFromStorageEntries() {
       openLink.style.fontFamily = 'Amazon Ember';
       openLink.addEventListener('click', (event) => {
         event.preventDefault();
-        chrome.runtime.sendMessage({
+        sendOpenAccountRoleMessage({
           action: 'openAccountRole',
           link: href,
           openIn,
@@ -202,7 +259,7 @@ async function createLinksFromStorageEntries() {
 
           serviceLink.addEventListener('click', (event) => {
             event.preventDefault();
-            chrome.runtime.sendMessage({
+            sendOpenAccountRoleMessage({
               action: 'openAccountRole',
               link: serviceLink.href,
               openIn,
@@ -327,7 +384,7 @@ function extractLoginLinksAndAddTabAndWindowUrls() {
         a.textContent = text;
         a.addEventListener('click', (event) => {
           event.preventDefault();
-          chrome.runtime.sendMessage({
+          sendOpenAccountRoleMessage({
             action: 'openAccountRole',
             link: account_role_url,
             openIn,
@@ -507,8 +564,9 @@ function showCompanionAppMissingDialog() {
   const message = document.createElement('div');
   message.textContent =
     "Opening an account/role in its own isolated window needs a small companion app " +
-    "installed on this PC, and it doesn't look like it's running right now. Install it, " +
-    'then reload this page.';
+    "installed on this computer, and it doesn't look like it's running right now. Open the " +
+    "setup instructions to install it for your operating system (Windows or macOS), then " +
+    'reload this page.';
   message.style.cssText = 'font-size:13px;margin-bottom:16px;line-height:1.4;';
   box.appendChild(message);
 
@@ -522,11 +580,15 @@ function showCompanionAppMissingDialog() {
   dismissButton.addEventListener('click', () => overlay.remove());
   actions.appendChild(dismissButton);
 
+  // A content script can't open this extension's own pages directly, so ask background.js to.
   const downloadLink = document.createElement('a');
-  downloadLink.href = COMPANION_APP_DOWNLOAD_URL;
-  downloadLink.target = '_blank';
-  downloadLink.rel = 'noopener noreferrer';
-  downloadLink.textContent = 'Download companion app';
+  downloadLink.href = '#';
+  downloadLink.textContent = 'Open setup instructions';
+  downloadLink.addEventListener('click', (event) => {
+    event.preventDefault();
+    chrome.runtime.sendMessage({ action: 'openWelcomePage' });
+    overlay.remove();
+  });
   downloadLink.style.cssText =
     'padding:6px 12px;cursor:pointer;background:#ec7211;color:#fff;border-radius:4px;' +
     'text-decoration:none;font-weight:bold;font-size:13px;';
@@ -561,6 +623,18 @@ if (
   extractLoginLinksAndAddTabAndWindowUrls();
 
   createLinksFromStorageEntries();
+
+  // Keeps the rendered list in sync with storage for the REST of this page's life, not just
+  // its first paint - see createLinksFromStorageEntries' own doc comment for why a one-time
+  // render silently went stale (clicking a link reorders recentfivelogins, and the native
+  // host's serviceVisited push writes into recentServicesByAccount, both well after this
+  // page's initial load). Scoped to this portal-page block (not registered unconditionally at
+  // the top of the file) since this list only ever belongs on this page.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && ('recentfivelogins' in changes || 'recentServicesByAccount' in changes)) {
+      createLinksFromStorageEntries();
+    }
+  });
 
   renderPortalSessionExpiry();
 
@@ -672,21 +746,57 @@ function consoleBannerColorFor(label) {
   return '#232f3e';
 }
 
+// Banner placement: INLINE, directly under AWS's own top nav bar (div#h), instead of pinned
+// to the bottom of the viewport. It sits in the normal page flow right below the nav so it is
+// the first thing seen, and it pushes the console content down rather than overlapping it.
+// position:unset (= static) makes left/right/bottom/z-index inert here; they are kept only so
+// the style string is identical to the fixed variant. If AWS's nav is not in the DOM yet (or
+// its markup ever changes) the old fixed-bottom bar is used so the label is never lost, and
+// insertConsoleBanner moves it under the nav as soon as the nav exists.
+let observedConsoleNavParent = null;
+
+function consoleBannerStyle(inline) {
+  return (inline ? 'position:unset;' : 'position:fixed;') +
+    'left:0;right:0;bottom:0;z-index:2147483647;' +
+    'box-sizing:border-box;background:' + consoleBannerColorFor(consoleLabelInfo.fullLabel) + ';color:#fff;' +
+    'text-align:center;padding:5px 8px;font-family:Arial,sans-serif;font-size:13px;font-weight:bold;';
+}
+
+function getConsoleNav() {
+  const nav = document.getElementById('h');
+  return (nav && nav.parentNode) ? nav : null;
+}
+
+// The nav's parent (div#b) is a child of body, not body itself, so the body-level observer in
+// observeConsoleBannerPersistence can't see the console rebuilding div#b's own children.
+function observeConsoleNavParent(parent) {
+  if (observedConsoleNavParent === parent) return;
+  observedConsoleNavParent = parent;
+  new MutationObserver(insertConsoleBanner).observe(parent, { childList: true });
+}
+
 function insertConsoleBanner() {
   if (!consoleLabelInfo) return;
   if (!document.body) return;
-  if (document.getElementById('awslh-profile-banner')) return;
 
-  // Pinned to the BOTTOM, not the top - AWS's own fixed header lives at the top of this page
-  // and fighting it for that space (collision, or content rendering behind ours) was a real
-  // problem the first time this banner was built. Nothing at the bottom to collide with.
-  const banner = document.createElement('div');
-  banner.id = 'awslh-profile-banner';
-  banner.textContent = consoleLabelInfo.fullLabel;
-  banner.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;' +
-    'box-sizing:border-box;background:' + consoleBannerColorFor(consoleLabelInfo.fullLabel) + ';color:#fff;' +
-    'text-align:center;padding:5px 8px;font-family:Arial,sans-serif;font-size:13px;font-weight:bold;';
-  document.body.appendChild(banner);
+  let banner = document.getElementById('awslh-profile-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'awslh-profile-banner';
+    banner.textContent = consoleLabelInfo.fullLabel;
+  }
+
+  const nav = getConsoleNav();
+  if (nav) {
+    if (banner.previousElementSibling !== nav) {
+      banner.style.cssText = consoleBannerStyle(true);
+      nav.parentNode.insertBefore(banner, nav.nextSibling);
+    }
+    observeConsoleNavParent(nav.parentNode);
+  } else if (!banner.parentNode) {
+    banner.style.cssText = consoleBannerStyle(false);
+    document.body.appendChild(banner);
+  }
 }
 
 function applyConsoleBanner() {

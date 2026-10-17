@@ -70,16 +70,6 @@ namespace AwsLoginHelperHost
         private static readonly object LabelsLock = new object();
         private static readonly object LocalStateLock = new object();
 
-        // Tracks the currently-running shared dedicated Chrome process (if any) so a brand-new
-        // profile's first-ever open can force a cold restart - see EnsureTabForProfileAsync's
-        // isBrandNewProfile branch and CloseSharedInstanceAsync below for why that's needed:
-        // ApplyKnownProfileDisplayNames only works while nothing owns this user-data-dir yet,
-        // but ChromeManager itself is re-created fresh per request (see Program.cs's Dispatch),
-        // so this can't be an ordinary instance field - it has to survive across requests the
-        // same way PortFile's on-disk state does. Set on every cold launch (both here and in
-        // EnsureColdStartPlaceholderWarmAsync), cleared once that process is confirmed gone.
-        private static Process _sharedInstanceProcess;
-
         // Serializes every COLD launch (first launch of the whole shared instance, or a forced
         // restart for a brand-new profile) - never taken for the common warm/singleton-forward
         // path, which stays exactly as concurrent as it always was. Without this, two requests
@@ -413,20 +403,16 @@ namespace AwsLoginHelperHost
         /// about:blank tab, and returns that tab's CDP WebSocket URL so the caller can inject
         /// cookies before navigating it anywhere real.
         ///
-        /// A brand-new profileKey (never opened before) forces a COLD RESTART of the whole
-        /// shared instance even if it's already warm and running other accounts/roles, rather
-        /// than the usual fast singleton-forward. This is the deliberate cost of making the OS-
-        /// level profile rename (ApplyKnownProfileDisplayNames) actually stick: that method can
-        /// only safely edit Local State while nothing owns this user-data-dir, which is never
-        /// true for a singleton-forwarded open once the cold-start placeholder has already
-        /// warmed the instance - without this, a brand-new account/role's display name would
-        /// never take effect until the whole instance happened to restart on its own. The
-        /// trade-off, chosen deliberately over leaving the OS name wrong: this profile's first
-        /// open pays the cold-start delay again (roughly the same ~600ms+ as a genuinely cold
-        /// instance), and any OTHER isolated windows already open in the shared instance get
-        /// closed and have to be reopened - both real, user-visible costs, accepted because the
-        /// alternative (Person 2/Person 3 forever) was worse. Every LATER open of this same
-        /// profileKey goes back to the normal fast singleton-forward path, same as before.
+        /// Opening an account/role NEVER restarts a running instance. A restart used to run
+        /// for every brand-new profileKey (so Local State could be renamed safely), which
+        /// closed every other isolated window the user had open - and even when nothing else
+        /// was open it stalled the click for seconds while the old instance shut down and a
+        /// new one started. Instead, a brand-new profileKey gets its friendly profile name
+        /// pre-seeded into its own Preferences file (SeedProfileDisplayName) and is opened
+        /// with the normal fast singleton-forward, same as every already-known profile. Only
+        /// when no instance is running at all does this cold-launch one - ApplyKnownProfile
+        /// DisplayNames then names every known profile via Local State, which is safe because
+        /// nothing owns the user-data-dir yet.
         /// </summary>
         public async Task<(string WebSocketUrl, int Port, string TargetId)> EnsureTabForProfileAsync(string profileKey)
         {
@@ -434,35 +420,25 @@ namespace AwsLoginHelperHost
             int? existingPort = await GetRunningCdpPortAsync();
             Logger.Log($"EnsureTabForProfileAsync[{profileKey}]: GetRunningCdpPortAsync -> {(existingPort?.ToString() ?? "null")} ({sw.ElapsedMilliseconds}ms)");
 
-            if (existingPort != null && !IsBrandNewProfile(profileKey))
+            if (existingPort != null)
             {
-                // Common case: instance already warm, and we've opened this exact profileKey
-                // before - no lock needed here at all, same as before this change.
+                // Common case: instance already warm - no lock needed here at all.
+                if (IsBrandNewProfile(profileKey)) SeedProfileDisplayName(profileKey);
                 return await ForwardIntoRunningInstanceAsync(profileKey, existingPort.Value);
             }
 
-            // Either nothing is running yet, or this profileKey is brand new and the instance
-            // needs restarting for its rename to stick - both paths launch fresh, so both go
-            // through LaunchLock to serialize against any other cold launch/restart happening
-            // at nearly the same moment (see LaunchLock's own doc comment).
+            // Nothing is running yet - launch fresh, serialized through LaunchLock against any
+            // other cold launch happening at nearly the same moment (see LaunchLock's own doc).
             await LaunchLock.WaitAsync();
             try
             {
-                // Re-check under the lock: another request could have already warmed (or
-                // restarted) the instance while this one was waiting its turn, in which case
-                // there's nothing left to do here but the normal singleton-forward.
+                // Re-check under the lock: another request could have already warmed the
+                // instance while this one was waiting its turn, in which case there's nothing
+                // left to do here but the normal singleton-forward.
                 existingPort = await GetRunningCdpPortAsync();
-                bool brandNew = IsBrandNewProfile(profileKey);
-
-                if (existingPort != null && brandNew)
-                {
-                    Logger.Log($"EnsureTabForProfileAsync[{profileKey}]: brand-new profile while instance is warm - forcing cold restart so its display name sticks");
-                    await CloseSharedInstanceAsync();
-                    existingPort = null;
-                }
-
                 if (existingPort != null)
                 {
+                    if (IsBrandNewProfile(profileKey)) SeedProfileDisplayName(profileKey);
                     return await ForwardIntoRunningInstanceAsync(profileKey, existingPort.Value);
                 }
 
@@ -475,39 +451,43 @@ namespace AwsLoginHelperHost
         }
 
         /// <summary>
-        /// Kills whatever shared dedicated Chrome process is currently tracked (if any) and
-        /// clears PortFile, so the next GetRunningCdpPortAsync check correctly reports "nothing
-        /// running" and a fresh cold launch can proceed. Callers must already hold LaunchLock -
-        /// this only tears the instance down, it never launches a replacement.
+        /// Pre-seeds a brand-new profile's own Preferences file with its friendly name, so it
+        /// can be opened into an already-running instance (no restart) and still come up named
+        /// "account | name | role" instead of "Person N". Safe while the instance runs because
+        /// that profile directory has never been loaded - Chrome isn't touching it - unlike
+        /// Local State, which Chrome rewrites continuously. Never touches an existing
+        /// Preferences file. EXPERIMENTAL: whether Chrome adopts profile.name from a
+        /// pre-existing Preferences file for a profile it hasn't registered yet is not
+        /// guaranteed. If it doesn't, the only effect is the cosmetic "Person N" name, which
+        /// ApplyKnownProfileDisplayNames still corrects at the next cold launch - the banner and
+        /// tab title identify the account/role either way. Best effort, never throws.
         /// </summary>
-        private async Task CloseSharedInstanceAsync()
+        private void SeedProfileDisplayName(string profileKey)
         {
             try
             {
-                if (_sharedInstanceProcess != null && !_sharedInstanceProcess.HasExited)
+                string profileDir = Path.Combine(ChromeUserDataDir, profileKey);
+                string prefsPath = Path.Combine(profileDir, "Preferences");
+                if (File.Exists(prefsPath)) return;
+
+                string label = ListKnownProfiles().FirstOrDefault(p => p.ProfileKey == profileKey).DisplayLabel ?? profileKey;
+
+                Directory.CreateDirectory(profileDir);
+                var prefs = new JObject
                 {
-                    // entireProcessTree=true: chrome.exe's own child renderer/GPU/utility
-                    // processes would otherwise be left as orphans - killing just the main
-                    // process doesn't take them down with it.
-                    _sharedInstanceProcess.Kill(entireProcessTree: true);
-                    _sharedInstanceProcess.WaitForExit(5000);
-                }
+                    ["profile"] = new JObject
+                    {
+                        ["name"] = label,
+                        ["using_default_name"] = false,
+                    },
+                };
+                File.WriteAllText(prefsPath, prefs.ToString(Newtonsoft.Json.Formatting.None), new System.Text.UTF8Encoding(false));
+                Logger.Log($"SeedProfileDisplayName[{profileKey}]: wrote Preferences with name '{label}'");
             }
             catch (Exception ex)
             {
-                Logger.LogError($"CloseSharedInstanceAsync: failed to kill previous instance (non-fatal, still relaunching): {ex}");
+                Logger.LogError($"SeedProfileDisplayName[{profileKey}] failed (non-fatal): {ex}");
             }
-            finally
-            {
-                _sharedInstanceProcess = null;
-                try { if (File.Exists(PortFile)) File.Delete(PortFile); } catch { /* best effort */ }
-            }
-
-            // Brief grace period for Windows to actually release the profile's lock files
-            // (Local State, the profile directories' own lock files) before relaunching -
-            // Kill() returning/WaitForExit() completing doesn't guarantee every file handle
-            // the OS was holding for that process has been released yet.
-            await Task.Delay(300);
         }
 
         /// <summary>
@@ -532,7 +512,7 @@ namespace AwsLoginHelperHost
 
             sw.Restart();
             int port = FindFreeTcpPort();
-            _sharedInstanceProcess = LaunchChrome(profileKey, port, "about:blank");
+            LaunchChrome(profileKey, port, "about:blank");
             Logger.Log($"EnsureTabForProfileAsync[{profileKey}]: LaunchChrome (fresh, port {port}) returned ({sw.ElapsedMilliseconds}ms)");
 
             sw.Restart();
@@ -551,10 +531,9 @@ namespace AwsLoginHelperHost
         }
 
         /// <summary>
-        /// The fast path: the shared instance is already running and this profileKey has
-        /// already been opened before (its rename, if any, is already baked into Local State
-        /// from an earlier cold launch) - just forward a new window into it. No lock needed;
-        /// this is exactly what ran unconditionally before this change.
+        /// The fast path: the shared instance is already running - just forward a new window
+        /// into it. No lock needed; this is also how a brand-new profileKey opens (after
+        /// SeedProfileDisplayName), since nothing ever restarts a running instance.
         /// </summary>
         private async Task<(string WebSocketUrl, int Port, string TargetId)> ForwardIntoRunningInstanceAsync(string profileKey, int port)
         {
@@ -620,13 +599,14 @@ namespace AwsLoginHelperHost
 
                 sw.Restart();
                 int port = FindFreeTcpPort();
-                _sharedInstanceProcess = LaunchChrome(ColdStartPlaceholderProfileKey, port, "about:blank", HiddenPlacementArgs, maximized: false);
+                LaunchChrome(ColdStartPlaceholderProfileKey, port, "about:blank", HiddenPlacementArgs, maximized: false);
                 Logger.Log($"EnsureColdStartPlaceholderWarmAsync: LaunchChrome (hidden placeholder, port {port}) returned ({sw.ElapsedMilliseconds}ms)");
 
                 sw.Restart();
                 await _cdp.WaitUntilAliveAsync(port, TimeSpan.FromSeconds(20));
                 Logger.Log($"EnsureColdStartPlaceholderWarmAsync: WaitUntilAliveAsync ({sw.ElapsedMilliseconds}ms)");
                 File.WriteAllText(PortFile, port.ToString());
+
 
                 Logger.Log("EnsureColdStartPlaceholderWarmAsync: instance is now warm and ready for a real click");
             }

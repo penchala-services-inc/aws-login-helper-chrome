@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>AWS-Login-Helper-Host-Chrome-Mac</AssemblyName>
+    <RootNamespace>AwsLoginHelperHost</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+
+    <Version>1.0.2</Version>
+    <FileVersion>1.0.2.0</FileVersion>
+    <AssemblyVersion>1.0.2.0</AssemblyVersion>
+    <InformationalVersion>1.0.2</InformationalVersion>
+
+    <!--
+      Deliberately no fixed RuntimeIdentifier property here, unlike the Windows build's
+      .csproj. Mac needs two architectures (Apple Silicon and Intel), and .NET doesn't produce
+      one universal single-file binary from a single publish, so the RID is supplied on the
+      command line instead of baked into the project (see package-mac/build.sh, which runs a
+      "dotnet publish" for osx-arm64 and again for osx-x64, each self-contained with
+      PublishSingleFile on). SelfContained + PublishSingleFile are still unconditional defaults
+      below, same "no runtime to pre-install, just run it" goal as the Windows build - they
+      just apply to whichever RID the command line supplies.
+
+      NOTE: avoid writing a literal double hyphen anywhere in this comment block - MSBuild
+      parses this file as XML, and "a dash dash" inside an XML comment is a hard parse error
+      (MSB4025), not just a style nit.
+    -->
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!--
+      No Microsoft.Win32.Registry reference here - unlike the Windows build, nothing in this
+      project touches the Windows Registry (there isn't one), so there's nothing for that
+      package to provide.
+    -->
+  </ItemGroup>
+
+</Project>

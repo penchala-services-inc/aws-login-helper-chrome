@@ -3,103 +3,188 @@
 <head>
   <meta charset="utf-8" />
   <title>AWS Login Helper - Get Started</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 620px;
-      margin: 48px auto;
-      padding: 0 24px;
-      color: #232f3e;
-      font-size: 15px;
-      line-height: 1.5;
-    }
-    h1 { font-size: 22px; margin-bottom: 4px; }
-    .subtitle { color: #545b64; margin-top: 0; }
-    .step {
-      display: flex;
-      gap: 14px;
-      margin: 28px 0;
-      padding: 16px;
-      border: 1px solid #e1e4e8;
-      border-radius: 8px;
-    }
-    .step.done { opacity: 0.6; }
-    .step-num {
-      flex: 0 0 auto;
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: #0972d3;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      font-size: 14px;
-    }
-    .step-body h2 { font-size: 16px; margin: 0 0 6px; }
-    .step-body p { margin: 0 0 12px; color: #414750; }
-    .button {
-      display: inline-block;
-      padding: 10px 18px;
-      background: #ec7211;
-      color: #fff;
-      text-decoration: none;
-      border-radius: 4px;
-      font-weight: bold;
-      font-size: 14px;
-    }
-    .secondary-link { font-size: 13px; }
-    .trust-box {
-      margin: 28px 0;
-      padding: 16px 18px;
-      background: #f0faf0;
-      border: 1px solid #c3e6c3;
-      border-radius: 8px;
-    }
-    .trust-box h2 { font-size: 15px; margin: 0 0 6px; color: #1d8102; }
-    .trust-box p { margin: 0 0 8px; color: #414750; font-size: 13.5px; }
-    .trust-box p:last-child { margin-bottom: 0; }
-    .trust-box a { color: #0972d3; }
-    footer { margin-top: 36px; font-size: 12px; color: #8a919b; }
-  </style>
+  <link rel="stylesheet" href="welcome.css" />
 </head>
 <body>
   <h1>AWS Login Helper is installed</h1>
   <p class="subtitle">One more step before you can open isolated account/role windows.</p>
 
-  <div class="step">
-    <div class="step-num">1</div>
-    <div class="step-body">
-      <h2>Install the companion app</h2>
-      <p>
-        A small, per-user Windows program does the actual work of opening each
-        AWS account/role in its own isolated window - no admin rights needed,
-        no UAC prompt.
-      </p>
-      <a class="button"
-         href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest"
-         target="_blank" rel="noopener noreferrer">Download companion app</a>
+  <!-- Platform tabs. Big on purpose - the install steps differ completely per OS, so the
+       first thing a visitor must notice is which one they're looking at. Without JavaScript
+       (welcome.js) both sections simply stay visible one after the other. -->
+  <div class="tabs-wrap">
+    <p class="tabs-heading">Choose your OS:</p>
+    <div class="tabs" role="tablist">
+      <button class="tab" type="button" data-platform="windows" role="tab" aria-controls="platform-windows">
+        <span class="tab-title">Windows</span>
+        <span class="tab-badge">Detected</span>
+      </button>
+      <button class="tab" type="button" data-platform="mac" role="tab" aria-controls="platform-mac">
+        <span class="tab-title">macOS</span>
+        <span class="tab-badge">Detected</span>
+      </button>
     </div>
+    <p class="os-note" id="os-note" hidden>
+      Linux and ChromeOS aren't supported yet - the companion app is built for Windows and macOS only.
+    </p>
   </div>
 
-  <div class="step">
-    <div class="step-num">2</div>
-    <div class="step-body">
-      <h2>Sign in and try it</h2>
-      <p>
-        Sign into your AWS IAM Identity Center (SSO / IIC) access portal as
-        usual. Every account/role on your list will have an "Isolated
-        (Window)" link next to it.
-      </p>
+  <!-- ===================================================================== -->
+  <!-- WINDOWS                                                               -->
+  <!-- ===================================================================== -->
+  <section class="platform" id="platform-windows" role="tabpanel">
+    <h2 class="platform-title">Windows</h2>
+
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h2>Install the companion app</h2>
+        <p>
+          A small, per-user Windows program does the actual work of opening each
+          AWS account/role in its own isolated window - no admin rights needed,
+          no UAC prompt. Download <code>AWS-Login-Helper-Host-Chrome.msi</code>
+          from the latest release below and run it.
+        </p>
+        <a class="button"
+           href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest"
+           target="_blank" rel="noopener noreferrer">Download companion app (AWS-Login-Helper-Host-Chrome.msi)</a>
+      </div>
     </div>
-  </div>
+
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h2>Sign in and try it</h2>
+        <p>
+          Sign into your AWS IAM Identity Center (SSO / IIC) access portal as
+          usual. Every account/role on your list will have an "Isolated
+          (Window)" link next to it.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- macOS                                                                 -->
+  <!-- ===================================================================== -->
+  <section class="platform" id="platform-mac" role="tabpanel">
+    <h2 class="platform-title">macOS</h2>
+
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h2>Download the companion app for your Mac</h2>
+        <p>
+          Pick the file that matches your Mac's chip. Not sure which? Open
+          Terminal and run <code>uname -m</code>: <code>arm64</code> means Apple
+          Silicon (M1, M2, M3 and later), <code>x86_64</code> means Intel.
+        </p>
+        <a class="button"
+           href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest/download/aws-login-helper-host-chrome-mac-osx-arm64.tar.gz"
+           rel="noopener noreferrer">Apple Silicon (arm64)</a>
+        <a class="button"
+           href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest/download/aws-login-helper-host-chrome-mac-osx-x64.tar.gz"
+           rel="noopener noreferrer">Intel (x64)</a>
+        <p class="secondary-link">
+          Or grab it from the
+          <a href="https://github.com/penchala-services-inc/aws-login-helper-chrome/releases/latest"
+             target="_blank" rel="noopener noreferrer">latest release page</a>.
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h2>Extract it and run the installer</h2>
+        <p>Open Terminal and run the commands for your Mac. The file is saved in Downloads by default.</p>
+
+        <div class="cmd-label">Apple Silicon</div>
+        <div class="cmd">cd ~/Downloads
+tar -xzf aws-login-helper-host-chrome-mac-osx-arm64.tar.gz
+cd osx-arm64
+bash install.sh<button class="copy" type="button">Copy</button></div>
+
+        <div class="cmd-label">Intel</div>
+        <div class="cmd">cd ~/Downloads
+tar -xzf aws-login-helper-host-chrome-mac-osx-x64.tar.gz
+cd osx-x64
+bash install.sh<button class="copy" type="button">Copy</button></div>
+
+        <p class="note">
+          The first run will be stopped by macOS - that's expected. The
+          companion app is open source but isn't signed by Apple, so macOS asks
+          you to approve it once. Keep going with the next step.
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h2>Allow the app in Privacy &amp; Security</h2>
+        <p>
+          Open <span class="ui">System Settings &rarr; Privacy &amp; Security</span>
+          and scroll down to the <span class="ui">Security</span> section. You'll see
+          <em>"AWS-Login-Helper-Host-Chrome-Mac" was blocked to protect your Mac</em>.
+          Click <span class="ui">Allow Anyway</span> (enter your password or use
+          Touch ID if asked).
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h2>Run the installer again and click Open Anyway</h2>
+        <p>Back in the same Terminal folder, run it again:</p>
+        <div class="cmd">bash install.sh<button class="copy" type="button">Copy</button></div>
+        <p>
+          macOS now asks <em>Open "AWS-Login-Helper-Host-Chrome-Mac"?</em> -
+          click <span class="ui">Open Anyway</span>. The installer then finishes
+          and registers the app with Chrome.
+        </p>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-body">
+        <h2>Clear the download warning</h2>
+        <p>Run this once in Terminal:</p>
+        <div class="cmd">xattr -d com.apple.quarantine "$HOME/Library/Application Support/AWS-Login-Helper-Host-Chrome/NativeHost/AWS-Login-Helper-Host-Chrome-Mac"<button class="copy" type="button">Copy</button></div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">6</div>
+      <div class="step-body">
+        <h2>Sign in, open an account/role, and allow it once more</h2>
+        <p>
+          Sign into your AWS IAM Identity Center (SSO / IIC) access portal as
+          usual and click an "Isolated (Window)" link next to any account/role.
+        </p>
+        <p>
+          macOS will show one more Privacy &amp; Security prompt, this time for
+          the app installed in your home folder:
+        </p>
+        <div class="cmd">$HOME/Library/Application Support/AWS-Login-Helper-Host-Chrome/NativeHost/AWS-Login-Helper-Host-Chrome-Mac<button class="copy" type="button">Copy</button></div>
+        <p>
+          Open <span class="ui">System Settings &rarr; Privacy &amp; Security</span>,
+          click <span class="ui">Allow Anyway</span>, then click the account/role
+          link again.
+        </p>
+        <p><strong>That's it - you're all set.</strong> You won't be asked again.</p>
+      </div>
+    </div>
+  </section>
 
   <div class="trust-box">
     <h2>Open source, nothing hidden</h2>
     <p>
       The companion app's entire source code is right there in this
-      project's repo, under <code>native-host/</code> - it isn't a separate,
+      project's repo, under <code>native-host/</code> (Windows) and
+      <code>native-host-mac/</code> (macOS) - it isn't a separate,
       closed-source download from somewhere else. All it does is launch a
       separate, dedicated Chrome window for each AWS account/role and copy
       your AWS SSO session cookie into it, so you don't have to sign in
@@ -119,5 +204,7 @@
   </p>
 
   <footer>AWS Login Helper - not affiliated with Amazon Web Services, Inc.</footer>
+
+  <script src="welcome.js"></script>
 </body>
 </html>

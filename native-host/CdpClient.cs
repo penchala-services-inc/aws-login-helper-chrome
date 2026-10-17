@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.WebSockets;
@@ -165,9 +166,9 @@ namespace AwsLoginHelperHost
         ///     not one single-document SPA - many in-console moves (switching services, regions,
         ///     etc.) are genuine full top-level navigations, not client-side route changes, so
         ///     the in-page MutationObservers alone were nowhere near enough. Fixed by
-        ///     StartBannerWatcher below, called by the caller right after this method returns -
-        ///     see its own doc comment for why that's a polling design rather than a second,
-        ///     longer-lived CDP attachment (that shape already failed once, above).
+        ///     RegisterProfileWindowAsync below, called by the caller right after this method
+        ///     returns - see its own doc comment for why that's a polling design rather than a
+        ///     second, longer-lived CDP attachment (that shape already failed once, above).
         /// </summary>
         public async Task SetCookiesAndNavigateAsync(string webSocketDebuggerUrl, List<CookieDto> cookies, string finalUrl, string consoleBannerLabel = null, string titleLabel = null)
         {
@@ -393,135 +394,286 @@ namespace AwsLoginHelperHost
         }
 
         // -----------------------------------------------------------------
-        // Banner watcher: keeps the banner/title correct across LATER full navigations in the
-        // same tab, not just the one SetCookiesAndNavigateAsync itself handles. See the doc
-        // comment on StartBannerWatcher below for the full design and why it polls instead of
-        // holding a second CDP session open.
+        // Instance watcher: keeps the banner/title correct across LATER full navigations, AND
+        // reports every AWS console service page actually visited inside a profile's isolated
+        // window - including in tabs the user opened BY HAND (ctrl/middle-clicking a service
+        // link in AWS's own console nav typically opens a new tab, not a same-tab navigation) -
+        // back to the extension, so "Recent Logins & Services" on the portal page reflects what
+        // really happened, not just the one url this host was originally asked to open.
+        //
+        // THIS USED TO BE PER-TARGET (StartBannerWatcher, one watcher per tab this host itself
+        // opened), which was enough when the only job was "keep re-injecting the banner into
+        // the one tab we know about." That falls apart the moment a SECOND tab appears in that
+        // same window that this host was never told about - a watcher keyed to only the
+        // original target id can never see it. Polling the WHOLE shared instance's /json/list
+        // and classifying every target found there (see ResolveWindowIdAsync below) catches a
+        // brand new tab the same way the old design caught an in-place navigation.
+        //
+        // HOW A TARGET GETS ATTRIBUTED TO AN ACCOUNT/ROLE: CDP's /json/list has no concept of
+        // "--profile-directory" at all - there is no field to read it from. What IS available
+        // is each target's own OS-level window (Browser.getWindowForTarget), and since every
+        // profile in this shared instance gets its own separate top-level window (never shared
+        // across profiles - see ChromeManager/EdgeManager's own design notes), a window's
+        // identity stands in for its profile's identity. RegisterProfileWindowAsync resolves
+        // and records that mapping once, right when a profile's window is first opened or
+        // forwarded into; every later poll tick looks a target's window up in that same map.
+        // The hidden cold-start placeholder window is never registered here at all, so it's
+        // silently never matched - no special-casing needed to exclude it.
+        // KNOWN GAP: a tab opened via "open in new WINDOW" (not tab) gets a brand new windowId
+        // this map was never told about, so it won't be attributed. "Open in new tab" - the
+        // common case for AWS's own console nav - is what this covers.
+        //
+        // WHY THIS POLLS /json/list INSTEAD OF HOLDING A CDP SESSION OPEN: same reasoning as
+        // the old per-target design's own doc comment (preserved in git history) - a CDP
+        // session left attached to a tab for its whole remaining life risks disabling its
+        // back/forward cache eligibility (see SetCookiesAndNavigateAsync's doc comment on task
+        // #14's "you've been signed out" bug). Polling a plain HTTP endpoint touches no tab's
+        // debugger attachment at all; only once a change is actually seen does this open any
+        // CDP session, and only as briefly as ReinjectBannerAsync/ResolveWindowIdAsync already
+        // do.
         // -----------------------------------------------------------------
 
-        // Keyed by CDP targetId (one entry per open tab this process is watching). Static, not
-        // an instance field: ChromeManager/EdgeManager (and therefore their own CdpClient) are
-        // recreated fresh on every single native-messaging request (see Program.cs's
-        // Dispatch), so anything that needs to survive BETWEEN requests - like "is a watcher
-        // already running for this tab" - has to live at the class level, not the instance
-        // level. The watcher loop itself removes its own entry when the tab closes or this
-        // process shuts down the CancellationTokenSource, so this dictionary never accumulates
-        // entries for tabs that are no longer open.
-        private static readonly ConcurrentDictionary<string, CancellationTokenSource> _bannerWatchers =
-            new ConcurrentDictionary<string, CancellationTokenSource>();
-
-        private static readonly TimeSpan BannerWatcherPollInterval = TimeSpan.FromSeconds(1.5);
-        private static readonly TimeSpan BannerWatcherPostNavigationDelay = TimeSpan.FromMilliseconds(500);
-
-        /// <summary>
-        /// Starts (if one isn't already running) a background loop that keeps re-injecting the
-        /// banner/title into <paramref name="targetId"/> every time its top-level url changes,
-        /// for as long as that tab stays open. Safe to call more than once for the same
-        /// targetId - later calls are a no-op while an earlier watcher for that exact tab is
-        /// still running.
-        ///
-        /// WHY THIS POLLS THE HTTP /json/list ENDPOINT INSTEAD OF JUST STAYING ATTACHED: a
-        /// tempting-looking alternative is to simply not close the WebSocket in
-        /// SetCookiesAndNavigateAsync at all - keep that same session open (with Page.disable
-        /// already called) for the tab's whole life, so
-        /// Page.addScriptToEvaluateOnNewDocument's registration keeps firing on every future
-        /// navigation for free. That was deliberately NOT done here, because it is a smaller
-        /// variant of the exact design that caused task #14's "you've been signed out" bug in
-        /// the first place (see SetCookiesAndNavigateAsync's own doc comment) - a CDP session
-        /// left attached to a tab for its whole remaining life, regardless of which individual
-        /// domains happen to be enabled at any given moment. Chromium's own source/docs don't
-        /// spell out whether disabling Page events while staying attached is actually enough
-        /// to keep the tab bfcache-eligible, or whether the attachment itself (independent of
-        /// Page.enable/disable) is what disqualifies it - and there is no way to test that
-        /// without a real machine. Given task #14 already happened once from a fix in this
-        /// same neighborhood, this avoids the whole question: it never holds any CDP session
-        /// open between navigations at all. The only thing it keeps doing in the background is
-        /// a plain HTTP GET against /json/list (Chrome's DevTools target-discovery endpoint,
-        /// not a debugger attachment of any kind - it doesn't touch bfcache, full stop). Only
-        /// once that poll notices the tab's url actually changed does it open a CDP session at
-        /// all, and that session is exactly as brief as the one SetCookiesAndNavigateAsync
-        /// already uses successfully for the very first landing: connect, run the script once
-        /// (via Runtime.evaluate, since the document is already loaded by the time we notice -
-        /// unlike the first landing, there's no future document to register the script
-        /// against), disconnect. Same proven-safe shape, just repeated on every later
-        /// navigation instead of running once.
-        ///
-        /// Trade-off accepted deliberately: there is a real, visible gap of up to roughly one
-        /// poll interval between a navigation actually happening and the banner/title
-        /// reappearing on the new page - this only notices the change on its next tick, it
-        /// doesn't see it happen live the way a held-open session would. That was judged worth
-        /// it for "the banner reliably shows up on every console page, every time" over
-        /// re-risking task #14 on an unverified assumption.
-        ///
-        /// initialUrl should be whatever url the tab is ALREADY sitting on right after
-        /// SetCookiesAndNavigateAsync returns - this seeds "last seen" so the very first poll
-        /// tick doesn't immediately re-fire a redundant (harmless, but wasted) injection for
-        /// the exact same page load that call already handled directly.
-        /// </summary>
-        public void StartBannerWatcher(int port, string targetId, string bannerLabel, string titleLabel, string initialUrl)
+        private sealed class ProfileWindowIdentity
         {
-            if (string.IsNullOrEmpty(bannerLabel) || string.IsNullOrEmpty(targetId)) return;
-
-            var cts = new CancellationTokenSource();
-            if (!_bannerWatchers.TryAdd(targetId, cts))
-            {
-                cts.Dispose();
-                return; // a watcher for this exact tab is already running
-            }
-
-            _ = Task.Run(() => RunBannerWatcherLoopAsync(port, targetId, bannerLabel, titleLabel, initialUrl, cts.Token));
+            public string ProfileKey;
+            public string AccountId;
+            public string AccountName;
+            public string RoleName;
+            public string DisplayLabel;
+            public string TitleLabel;
         }
 
-        private async Task RunBannerWatcherLoopAsync(int port, string targetId, string bannerLabel, string titleLabel, string initialUrl, CancellationToken ct)
-        {
-            string lastSeenUrl = initialUrl;
-            Logger.Log($"BannerWatcher[{targetId}]: starting, initial url = {initialUrl}");
+        // windowId -> which account/role's window this is. Static, not an instance field, for
+        // the same reason the old _bannerWatchers dictionary was: ChromeManager/EdgeManager
+        // (and therefore their own CdpClient) are recreated fresh on every single native-
+        // messaging request (see Program.cs's Dispatch), so anything that needs to survive
+        // BETWEEN requests has to live at the class level.
+        private static readonly ConcurrentDictionary<int, ProfileWindowIdentity> _profileWindows =
+            new ConcurrentDictionary<int, ProfileWindowIdentity>();
 
+        // One watcher loop per shared-instance port (not per target - see doc comment above).
+        private static readonly ConcurrentDictionary<int, CancellationTokenSource> _instanceWatchers =
+            new ConcurrentDictionary<int, CancellationTokenSource>();
+
+        // Per-target bookkeeping the poll loop needs across ticks.
+        private static readonly ConcurrentDictionary<string, string> _lastSeenUrlByTarget =
+            new ConcurrentDictionary<string, string>();
+        private static readonly ConcurrentDictionary<string, int> _windowIdByTarget =
+            new ConcurrentDictionary<string, int>();
+
+        private static readonly TimeSpan InstanceWatcherPollInterval = TimeSpan.FromSeconds(1.5);
+        private static readonly TimeSpan InstanceWatcherPostNavigationDelay = TimeSpan.FromMilliseconds(500);
+        private static readonly Regex ConsoleUrlPattern = new Regex(@"\.console\.aws\.amazon\.com/", RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Derives the AWS service name from a console url's first path segment - the exact
+        /// same rule extension/background.js's own extractServiceName uses for the main-profile
+        /// case (where a loaded content script can read window.location directly). Needed here
+        /// too because tabs inside the dedicated, extension-less instance have no content
+        /// script to do this for themselves at all - the native host is the only thing that
+        /// ever sees these urls.
+        /// </summary>
+        private static string ExtractServiceName(string url)
+        {
+            try
+            {
+                string path = new Uri(url).AbsolutePath;
+                return path.Split('/').FirstOrDefault(s => !string.IsNullOrEmpty(s)) ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Call once, right after opening or forwarding into a profile's tab (see Program.cs's
+        /// HandleSyncAndOpen), to (1) record which window that profile now owns, for every
+        /// later poll tick's lookup, and (2) make sure the shared per-port instance watcher is
+        /// actually running. Safe to call repeatedly for the same profile/window - both steps
+        /// are idempotent. stdout is threaded all the way through from Program.cs's own
+        /// RunNativeMessagingLoop - NativeMessaging.WriteMessage's internal lock already makes
+        /// it safe to write to from this background loop at the same time as any in-flight
+        /// request's own response.
+        /// </summary>
+        public async Task RegisterProfileWindowAsync(
+            int port, string targetId, Stream stdout,
+            string profileKey, string accountId, string accountName, string roleName,
+            string displayLabel, string titleLabel, string initialUrl)
+        {
+            if (string.IsNullOrEmpty(targetId)) return;
+
+            try
+            {
+                string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+                int? windowId = await ResolveWindowIdAsync(wsUrl);
+                if (windowId == null)
+                {
+                    Logger.LogError($"RegisterProfileWindowAsync[{profileKey}]: could not resolve a windowId - service reporting/banner-on-new-tab won't work for this window until it's reopened.");
+                }
+                else
+                {
+                    _profileWindows[windowId.Value] = new ProfileWindowIdentity
+                    {
+                        ProfileKey = profileKey,
+                        AccountId = accountId,
+                        AccountName = accountName,
+                        RoleName = roleName,
+                        DisplayLabel = displayLabel,
+                        TitleLabel = titleLabel,
+                    };
+                    _windowIdByTarget[targetId] = windowId.Value;
+                    Logger.Log($"RegisterProfileWindowAsync[{profileKey}]: windowId={windowId.Value}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"RegisterProfileWindowAsync[{profileKey}]: failed to resolve windowId (non-fatal, same effect as above) - {ex}");
+            }
+
+            _lastSeenUrlByTarget[targetId] = initialUrl;
+            StartInstanceWatcher(port, stdout);
+        }
+
+        private void StartInstanceWatcher(int port, Stream stdout)
+        {
+            var cts = new CancellationTokenSource();
+            if (!_instanceWatchers.TryAdd(port, cts))
+            {
+                cts.Dispose();
+                return; // a watcher for this exact shared instance is already running
+            }
+
+            _ = Task.Run(() => RunInstanceWatcherLoopAsync(port, stdout, cts.Token));
+        }
+
+        private async Task RunInstanceWatcherLoopAsync(int port, Stream stdout, CancellationToken ct)
+        {
+            Logger.Log($"InstanceWatcher[port {port}]: starting");
             try
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    await Task.Delay(BannerWatcherPollInterval, ct);
+                    await Task.Delay(InstanceWatcherPollInterval, ct);
 
-                    string currentUrl;
+                    List<(string Id, string Url)> targets;
                     try
                     {
-                        var response = await _http.GetStringAsync($"http://127.0.0.1:{port}/json/list");
-                        var array = JArray.Parse(response);
-                        var match = array.FirstOrDefault(t => (string)t["id"] == targetId);
-                        if (match == null)
-                        {
-                            Logger.Log($"BannerWatcher[{targetId}]: target gone, stopping");
-                            return;
-                        }
-                        currentUrl = (string)match["url"];
+                        targets = await ListPageTargetsAsync(port);
                     }
                     catch (Exception ex)
                     {
                         // Transient - Chrome's debugging endpoint can hiccup, the whole instance
                         // could even be mid-relaunch. Never let one bad poll kill the loop.
-                        Logger.LogError($"BannerWatcher[{targetId}]: poll failed (non-fatal, retrying) - {ex.Message}");
+                        Logger.LogError($"InstanceWatcher[port {port}]: poll failed (non-fatal, retrying) - {ex.Message}");
                         continue;
                     }
 
-                    if (string.IsNullOrEmpty(currentUrl) || currentUrl == lastSeenUrl) continue;
-
-                    Logger.Log($"BannerWatcher[{targetId}]: url changed [{lastSeenUrl}] -> [{currentUrl}]");
-                    lastSeenUrl = currentUrl;
-
-                    try
+                    if (targets.Count == 0)
                     {
-                        // Give the new document a brief moment to actually start existing
-                        // before we try to run script against it - the script itself (see
-                        // BuildConsoleBannerScript) also retries and sets up MutationObservers,
-                        // so this is just avoiding the most common case of injecting into a
-                        // not-yet-parsed document rather than depending on it.
-                        await Task.Delay(BannerWatcherPostNavigationDelay, ct);
-                        await ReinjectBannerAsync(port, targetId, bannerLabel, titleLabel);
+                        Logger.Log($"InstanceWatcher[port {port}]: no targets left, stopping");
+                        return;
                     }
-                    catch (Exception ex)
+
+                    foreach (var (targetId, url) in targets)
                     {
-                        Logger.LogError($"BannerWatcher[{targetId}]: reinject failed (non-fatal) - {ex}");
+                        if (string.IsNullOrEmpty(url)) continue;
+
+                        bool isNewTarget = !_lastSeenUrlByTarget.ContainsKey(targetId);
+                        bool urlUnchanged = !isNewTarget && _lastSeenUrlByTarget[targetId] == url;
+                        _lastSeenUrlByTarget[targetId] = url;
+
+                        if (urlUnchanged)
+                        {
+                            // Same target, same url as last tick. Almost always this just means
+                            // "still sitting on the same page" and there's nothing to do - but
+                            // it's also exactly what a plain refresh (F5) looks like from here,
+                            // since reloading a page never changes its URL. A refresh wipes
+                            // every injected script along with the rest of the document, so
+                            // without this check the banner would simply stay gone until the
+                            // user next navigates somewhere else. See IsBannerPresentAsync's own
+                            // doc comment for the detection side of this.
+                            if (_windowIdByTarget.TryGetValue(targetId, out int knownWindowId) &&
+                                _profileWindows.TryGetValue(knownWindowId, out var knownIdentity) &&
+                                ConsoleUrlPattern.IsMatch(url))
+                            {
+                                bool present = await IsBannerPresentAsync(port, targetId);
+                                if (!present)
+                                {
+                                    Logger.Log($"InstanceWatcher[port {port}]: [{knownIdentity.ProfileKey}] banner missing on an unchanged url (likely a refresh) -> reinjecting");
+                                    try
+                                    {
+                                        await ReinjectBannerAsync(port, targetId, knownIdentity.DisplayLabel, knownIdentity.TitleLabel);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Logger.LogError($"InstanceWatcher[port {port}]: reinject-after-refresh failed (non-fatal) - {ex}");
+                                    }
+                                }
+                            }
+                            // Either way, nothing NEW was visited here - just a refresh (or a
+                            // steady-state tab) - so there's no serviceVisited push to make.
+                            continue;
+                        }
+
+                        if (!_windowIdByTarget.TryGetValue(targetId, out int windowId))
+                        {
+                            try
+                            {
+                                string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+                                int? resolved = await ResolveWindowIdAsync(wsUrl);
+                                if (resolved == null) continue; // try again next tick
+                                windowId = resolved.Value;
+                                _windowIdByTarget[targetId] = windowId;
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.LogError($"InstanceWatcher[port {port}]: failed to resolve windowId for new target {targetId} (will retry) - {ex.Message}");
+                                continue;
+                            }
+                        }
+
+                        // Not one of our own profile windows (or the hidden cold-start
+                        // placeholder, which is never registered into _profileWindows at all).
+                        if (!_profileWindows.TryGetValue(windowId, out var identity)) continue;
+                        if (!ConsoleUrlPattern.IsMatch(url)) continue; // nothing to re-banner or report
+
+                        Logger.Log($"InstanceWatcher[port {port}]: [{identity.ProfileKey}] {(isNewTarget ? "new tab" : "navigated")} -> {url}");
+
+                        try
+                        {
+                            // Give the new document a brief moment to actually start existing
+                            // before running script against it - BuildConsoleBannerScript also
+                            // retries and sets up MutationObservers, so this just avoids the
+                            // most common case of injecting into a not-yet-parsed document.
+                            await Task.Delay(InstanceWatcherPostNavigationDelay, ct);
+                            await ReinjectBannerAsync(port, targetId, identity.DisplayLabel, identity.TitleLabel);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogError($"InstanceWatcher[port {port}]: reinject failed (non-fatal) - {ex}");
+                        }
+
+                        try
+                        {
+                            var push = new JObject
+                            {
+                                ["action"] = "serviceVisited",
+                                ["accountId"] = identity.AccountId,
+                                ["accountName"] = identity.AccountName,
+                                ["roleName"] = identity.RoleName,
+                                ["serviceName"] = ExtractServiceName(url),
+                                ["url"] = url,
+                            };
+                            // No __requestId - this is an unsolicited push, not a response to
+                            // any pending request. See background.js's nativePort.onMessage
+                            // listener for the matching read side.
+                            NativeMessaging.WriteMessage(stdout, push.ToString(Newtonsoft.Json.Formatting.None));
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogError($"InstanceWatcher[port {port}]: failed to push serviceVisited (non-fatal) - {ex}");
+                        }
                     }
                 }
             }
@@ -531,8 +683,33 @@ namespace AwsLoginHelperHost
             }
             finally
             {
-                _bannerWatchers.TryRemove(targetId, out _);
-                Logger.Log($"BannerWatcher[{targetId}]: stopped");
+                _instanceWatchers.TryRemove(port, out _);
+                Logger.Log($"InstanceWatcher[port {port}]: stopped");
+            }
+        }
+
+        /// <summary>
+        /// Resolves the OS-level window a given tab's CDP target belongs to - see this
+        /// section's own top-of-block doc comment for why that's the only reliable way to tell
+        /// which account/role profile a tab belongs to. Brief, standalone CDP session: connect,
+        /// ask, disconnect - same shape as ReinjectBannerAsync below.
+        /// </summary>
+        private static async Task<int?> ResolveWindowIdAsync(string webSocketDebuggerUrl)
+        {
+            using (var ws = new ClientWebSocket())
+            {
+                ws.Options.Proxy = null;
+                await ws.ConnectAsync(new Uri(webSocketDebuggerUrl), CancellationToken.None);
+
+                var windowInfo = await SendAndAwaitAsync(ws, 1, "Browser.getWindowForTarget", new JObject());
+                var windowId = windowInfo["result"]?["windowId"];
+
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+                }
+
+                return windowId?.Value<int>();
             }
         }
 
@@ -571,6 +748,48 @@ namespace AwsLoginHelperHost
             }
         }
 
+        /// <summary>
+        /// Answers "is our banner div still in this document right now" - the piece that was
+        /// missing for a plain refresh (F5) of an already-bannered console tab. A refresh keeps
+        /// the tab's URL identical, so RunInstanceWatcherLoopAsync's own "did the URL change"
+        /// check alone can never notice it; this gives that loop a second, independent signal
+        /// to fall back on for exactly that case. Same brief connect/evaluate/disconnect shape
+        /// as ResolveWindowIdAsync/ReinjectBannerAsync above - never holds a session open.
+        /// Best-effort: treats any failure (closed tab, no document yet, mid-navigation) as
+        /// "present", so a transient hiccup here can never cause an unwanted reinject - only a
+        /// confirmed, successfully-read "false" does.
+        /// </summary>
+        private async Task<bool> IsBannerPresentAsync(int port, string targetId)
+        {
+            try
+            {
+                string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+                using (var ws = new ClientWebSocket())
+                {
+                    ws.Options.Proxy = null;
+                    await ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+
+                    var response = await SendAndAwaitAsync(ws, 1, "Runtime.evaluate", new JObject
+                    {
+                        ["expression"] = "!!document.getElementById('awslh-profile-banner')",
+                        ["returnByValue"] = true,
+                    });
+
+                    if (ws.State == WebSocketState.Open)
+                    {
+                        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+                    }
+
+                    var value = response["result"]?["result"]?["value"];
+                    return value == null || value.Value<bool>();
+                }
+            }
+            catch
+            {
+                return true; // see doc comment above - never let a check failure force a reinject
+            }
+        }
+
         // Ported from the Firefox extension's own SaveConsoleCookieExpiryDateTime: the AWS
         // console's own session cookie, historically named 'aws-creds' and scoped to a path
         // containing '/console'. UNVERIFIED against a current console session - AWS may have
@@ -581,9 +800,9 @@ namespace AwsLoginHelperHost
         // session and update this constant if it's wrong.
         private const string SessionCookieName = "aws-creds";
 
-        // Real, published Chrome Web Store id (lbnopneedeeomcfebahnkankbedjjlfk) - same id as
+        // Real, published Chrome Web Store id (cpjgfffnippggeadnapfeggfifkmomag) - same id as
         // content.js's matching constant for the portal-page half of this same link.
-        private const string ExtensionReviewUrl = "https://chromewebstore.google.com/detail/lbnopneedeeomcfebahnkankbedjjlfk/reviews";
+        private const string ExtensionReviewUrl = "https://chromewebstore.google.com/detail/aws-login-helper/cpjgfffnippggeadnapfeggfifkmomag/reviews";
 
         /// <summary>
         /// Reads <paramref name="cookieName"/>'s own expiration (CDP's "expires", a Unix
@@ -779,7 +998,7 @@ namespace AwsLoginHelperHost
         /// <summary>
         /// Builds a script that only acts once location.hostname is an actual
         /// *.console.aws.amazon.com page (never during the awsapps.com SSO redirect chain).
-        /// Inserts the full label as a fixed bar pinned to the bottom of the viewport, and
+        /// Inserts the full label as an inline bar directly under AWS's top nav (div#h), and
         /// prefixes just the account name onto the tab/window title. Idempotent - checks for
         /// its own marker id before inserting - so re-running it later (e.g. if this exact
         /// script were ever re-injected) is harmless. Survives the AWS console's own SPA-style
@@ -840,18 +1059,29 @@ namespace AwsLoginHelperHost
     }
   }
 
-  function insertBanner() {
-    if (!document.body) return;
-    if (document.getElementById('awslh-profile-banner')) return;
+  // Banner placement: INLINE, directly under AWS's own top nav bar (div#h), instead of
+  // pinned to the bottom of the viewport. It sits in the normal page flow right below the nav
+  // so it is the first thing seen, and it pushes the console content down rather than
+  // overlapping it. position:unset (= static) makes left/right/bottom/z-index inert here; they
+  // are kept only so the style string is identical to the fixed variant below.
+  // If AWS's nav is not in the DOM yet (or its markup ever changes) the old fixed-bottom bar
+  // is used so the label is never lost, and insertBanner moves it under the nav as soon as
+  // the nav exists.
+  var BANNER_BASE_STYLE = 'left:0;right:0;bottom:0;z-index:2147483647;' +
+    'box-sizing:border-box;background:' + COLOR + ';color:#fff;text-align:center;' +
+    'padding:5px 8px;font-family:Arial,sans-serif;font-size:13px;font-weight:bold;';
+  var BANNER_INLINE_STYLE = 'position:unset;' + BANNER_BASE_STYLE;
+  var BANNER_FALLBACK_STYLE = 'position:fixed;' + BANNER_BASE_STYLE;
+  var observedNavParent = null;
 
-    // Pinning to the BOTTOM of the viewport sidesteps a fight with AWS's own fixed
-    // top header/nav: nothing there to collide with, and being viewport-fixed means we
-    // don't need to push any of AWS's own content down to make room.
+  function getNav() {
+    var nav = document.getElementById('h');
+    return (nav && nav.parentNode) ? nav : null;
+  }
+
+  function buildBanner() {
     var banner = document.createElement('div');
     banner.id = 'awslh-profile-banner';
-    banner.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;' +
-      'box-sizing:border-box;background:' + COLOR + ';color:#fff;text-align:center;' +
-      'padding:5px 8px;font-family:Arial,sans-serif;font-size:13px;font-weight:bold;';
 
     // Split into two spans (label + expiry) rather than one textContent string, so the
     // expiry half can be updated on its own every 60s without touching - or re-reading -
@@ -874,8 +1104,32 @@ namespace AwsLoginHelperHost
     rateLink.textContent = 'Rate AWS Login Helper Extension';
     rateLink.style.cssText = 'margin-left:10px;color:#fff;text-decoration:underline;opacity:0.85;';
     banner.appendChild(rateLink);
+    return banner;
+  }
 
-    document.body.appendChild(banner);
+  // The nav's parent (div#b) is a child of body, not body itself, so the body-level observer
+  // below can't see the console rebuilding div#b's own children. Watch that one level too.
+  function observeNavParent(parent) {
+    if (observedNavParent === parent) return;
+    observedNavParent = parent;
+    new MutationObserver(insertBanner).observe(parent, { childList: true });
+  }
+
+  function insertBanner() {
+    if (!document.body) return;
+    var nav = getNav();
+    var banner = document.getElementById('awslh-profile-banner') || buildBanner();
+
+    if (nav) {
+      if (banner.previousElementSibling !== nav) {
+        banner.style.cssText = BANNER_INLINE_STYLE;
+        nav.parentNode.insertBefore(banner, nav.nextSibling);
+      }
+      observeNavParent(nav.parentNode);
+    } else if (!banner.parentNode) {
+      banner.style.cssText = BANNER_FALLBACK_STYLE;
+      document.body.appendChild(banner);
+    }
   }
 
   function formatDurationHM(totalSeconds) {
@@ -942,7 +1196,6 @@ namespace AwsLoginHelperHost
     }
     new MutationObserver(insertBanner).observe(document.body, { childList: true });
   }
-  observeBodyChildren();
 
   // The title specifically needs more than fixed retries: AWS's own SPA keeps setting
   // document.title itself as it finishes loading (account name, service name, etc.), and it
@@ -960,7 +1213,20 @@ namespace AwsLoginHelperHost
     }
     new MutationObserver(ensureTitle).observe(titleEl, { childList: true, characterData: true, subtree: true });
   }
-  observeTitle();
+
+  // Same reasoning as the __awslhExpiryIntervalId guard above, extended to these two
+  // observers: the instance watcher now re-runs this whole script on a still-open,
+  // never-reloaded document too (a presence check it does to detect a same-URL refresh -
+  // see RunInstanceWatcherLoopAsync's own comments), so unlike before, 'ran more than once
+  // against the same live document' is no longer just a theoretical case to guard against.
+  // Without this guard, each extra run would stack one more MutationObserver on top of the
+  // last - still harmless (every one of them calls the same idempotent insertBanner/
+  // ensureTitle), but pure waste that only grows over a long-lived tab.
+  if (!window.__awslhBannerObserversInstalled) {
+    window.__awslhBannerObserversInstalled = true;
+    observeBodyChildren();
+    observeTitle();
+  }
 })();
 ";
         }
