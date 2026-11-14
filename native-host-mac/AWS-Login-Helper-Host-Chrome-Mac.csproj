@@ -8,10 +8,10 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
 
-    <Version>1.0.2</Version>
-    <FileVersion>1.0.2.0</FileVersion>
-    <AssemblyVersion>1.0.2.0</AssemblyVersion>
-    <InformationalVersion>1.0.2</InformationalVersion>
+    <Version>1.0.3</Version>
+    <FileVersion>1.0.3.0</FileVersion>
+    <AssemblyVersion>1.0.3.0</AssemblyVersion>
+    <InformationalVersion>1.0.3</InformationalVersion>
 
     <!--
       Deliberately no fixed RuntimeIdentifier property here, unlike the Windows build's

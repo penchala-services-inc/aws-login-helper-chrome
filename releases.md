@@ -5,26 +5,22 @@ Covers the extension (`extension/`) and the companion native host
 released as one unit. For the original Firefox extension's own, much longer
 release history, see `../RELEASES.md` at the repo root.
 
+## v1.0.3 (10/31/2026)
+
+- One-click reauth: if an isolated window's session expires, sign in again on the AWS
+  access portal, come back to that window, and one click on the note resumes exactly
+  where you left off - no re-entering MFA, no getting stuck on AWS's sign-in page.
+
 ## v1.0.2 (10/16/2026)
 
 Bug fixes, found through hands-on testing on real Chrome:
 
-- Recent Logins & Services links did nothing when clicked. Chrome's MV3
-  service worker can go idle and silently drop a `chrome.runtime.sendMessage`
-  call sent well after the page loaded - `content.js` now retries once and
-  surfaces a clear error if it still fails, instead of failing silently.
-- Opening a service (e.g. S3) by hand inside an isolated account/role window
-  never showed up back on the portal page's Recent Logins & Services list.
-  The native host now watches for new/changed tabs inside each isolated
-  window and reports what was visited back to the extension over native
-  messaging.
-- The Recent Logins & Services list didn't update after new services were
-  recorded - fixed by rebuilding it from storage and listening for storage
-  changes.
-- Refreshing an isolated console window (F5) wiped the account/role banner
-  and it never came back, since a plain refresh keeps the same URL and the
-  watcher only re-injected the banner on a URL change. It now also checks
-  whether the banner is still present and re-injects if it's missing.
+- Recent Logins & Services links sometimes did nothing when clicked.
+- Opening a service (e.g. S3) by hand inside an isolated window wasn't showing up on the
+  portal page's Recent Logins & Services list.
+- The Recent Logins & Services list didn't update right away when a new service was visited.
+- Refreshing an isolated console window (F5) could make the account/role banner disappear
+  for good.
 
 ## v1.0.1
 

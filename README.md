@@ -76,6 +76,12 @@ which account you're in. Opening a service by hand inside that window (e.g.
 clicking into S3) gets reported back too, so it shows up under "Recent
 Logins & Services" on the portal page next time you look.
 
+If an isolated window's session expires, a note appears right on the page
+telling you to re-authenticate on the AWS access portal and come back. One
+click on that note's link and the window picks up right where you left off
+- no re-entering MFA in that window, no getting dropped back on AWS's own
+sign-in page.
+
 For the full mechanics - why a second browser instance, how a click flows
 end to end, how the banner gets injected - see [development.md](development.md).
 

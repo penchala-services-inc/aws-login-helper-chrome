@@ -59,18 +59,20 @@ namespace AwsLoginHelperHost
             throw new TimeoutException($"Chrome DevTools endpoint on port {port} never became reachable.");
         }
 
-        // Returns (id, url) for every current "page" target (i.e. tab), as reported by the
-        // /json/list HTTP endpoint.
-        public async Task<List<(string Id, string Url)>> ListPageTargetsAsync(int port)
+        // Returns (id, url, title) for every current "page" target (i.e. tab), as reported by
+        // the /json/list HTTP endpoint. Title rides along purely for
+        // RunInstanceWatcherLoopAsync's signed-out detection (see
+        // SignedOutTitleMarkerPrefix) - every other caller just ignores it.
+        public async Task<List<(string Id, string Url, string Title)>> ListPageTargetsAsync(int port)
         {
             var response = await _http.GetStringAsync($"http://127.0.0.1:{port}/json/list");
             var array = JArray.Parse(response);
-            var result = new List<(string Id, string Url)>();
+            var result = new List<(string Id, string Url, string Title)>();
             foreach (var item in array)
             {
                 var type = (string)item["type"];
                 if (type != "page") continue;
-                result.Add(((string)item["id"], (string)item["url"]));
+                result.Add(((string)item["id"], (string)item["url"], (string)item["title"]));
             }
             return result;
         }
@@ -170,8 +172,9 @@ namespace AwsLoginHelperHost
         ///     returns - see its own doc comment for why that's a polling design rather than a
         ///     second, longer-lived CDP attachment (that shape already failed once, above).
         /// </summary>
-        public async Task SetCookiesAndNavigateAsync(string webSocketDebuggerUrl, List<CookieDto> cookies, string finalUrl, string consoleBannerLabel = null, string titleLabel = null)
+        public async Task SetCookiesAndNavigateAsync(string webSocketDebuggerUrl, List<CookieDto> cookies, string finalUrl, string consoleBannerLabel = null, string titleLabel = null, string accountId = null, string roleName = null, string portalBaseUrl = null)
         {
+            UpdateLastKnownAwsAppsCookies(cookies);
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using (var ws = new ClientWebSocket())
             {
@@ -253,14 +256,27 @@ namespace AwsLoginHelperHost
                     }
 
                     sw.Restart();
-                    await SendAndAwaitAsync(ws, nextId++, "Network.setCookie", parms);
-                    Logger.Log($"SetCookiesAndNavigateAsync: Network.setCookie [{cookie.Name}] ({sw.ElapsedMilliseconds}ms)");
+                    // Same silent-rejection gap as SetCookiesOnlyAsync's own doc comment
+                    // describes (Network.setCookie can return success normally at the CDP
+                    // protocol level while result.success is false, meaning Chrome itself
+                    // declined to store the cookie) - checked here too so a rejected cookie is
+                    // visible in the log instead of looking identical to a successful one.
+                    JObject setCookieResponse = await SendAndAwaitAsync(ws, nextId++, "Network.setCookie", parms);
+                    bool setCookieSucceeded = (bool?)setCookieResponse?["result"]?["success"] ?? false;
+                    if (setCookieSucceeded)
+                    {
+                        Logger.Log($"SetCookiesAndNavigateAsync: Network.setCookie [{cookie.Name}] ({sw.ElapsedMilliseconds}ms)");
+                    }
+                    else
+                    {
+                        Logger.LogError($"SetCookiesAndNavigateAsync: Chrome REJECTED cookie [{cookie.Name}] domain={cookie.Domain} path={parms["path"]} secure={cookie.Secure} sameSite={(string)parms["sameSite"]} - result.success=false (no CDP-level error)");
+                    }
                 }
 
                 if (!string.IsNullOrEmpty(consoleBannerLabel))
                 {
                     sw.Restart();
-                    string script = BuildConsoleBannerScript(consoleBannerLabel, string.IsNullOrEmpty(titleLabel) ? consoleBannerLabel : titleLabel);
+                    string script = BuildConsoleBannerScript(consoleBannerLabel, string.IsNullOrEmpty(titleLabel) ? consoleBannerLabel : titleLabel, null, accountId, roleName, portalBaseUrl);
                     await SendAndAwaitAsync(ws, nextId++, "Page.addScriptToEvaluateOnNewDocument", new JObject { ["source"] = script });
                     Logger.Log($"SetCookiesAndNavigateAsync: Page.addScriptToEvaluateOnNewDocument ({sw.ElapsedMilliseconds}ms)");
                 }
@@ -345,7 +361,7 @@ namespace AwsLoginHelperHost
 
                             if (sessionExpiry.HasValue)
                             {
-                                string refreshedScript = BuildConsoleBannerScript(consoleBannerLabel, string.IsNullOrEmpty(titleLabel) ? consoleBannerLabel : titleLabel, sessionExpiry);
+                                string refreshedScript = BuildConsoleBannerScript(consoleBannerLabel, string.IsNullOrEmpty(titleLabel) ? consoleBannerLabel : titleLabel, sessionExpiry, accountId, roleName, portalBaseUrl);
                                 await SendAndAwaitAsync(expiryWs, 2, "Runtime.evaluate", new JObject { ["expression"] = refreshedScript });
                             }
 
@@ -441,6 +457,15 @@ namespace AwsLoginHelperHost
             public string RoleName;
             public string DisplayLabel;
             public string TitleLabel;
+
+            // The IIC/SSO portal's own origin+path this window's account/role link was
+            // originally clicked from (e.g. "https://foc-sso.awsapps.com/start/"), with no
+            // hash route on it - see content.js's own doc comment on where this comes from.
+            // Empty for a window opened before this field existed (an older extension build,
+            // or a persisted profile-windows.json entry from before v1.0.6) -
+            // BuildConsoleBannerScript treats that as "can't rebuild the federation link for
+            // this window" and falls back to plain-text guidance instead of a clickable link.
+            public string PortalBaseUrl;
         }
 
         // windowId -> which account/role's window this is. Static, not an instance field, for
@@ -448,8 +473,41 @@ namespace AwsLoginHelperHost
         // (and therefore their own CdpClient) are recreated fresh on every single native-
         // messaging request (see Program.cs's Dispatch), so anything that needs to survive
         // BETWEEN requests has to live at the class level.
+        //
+        // BUT "the class level" only survives within ONE host process, and this process does
+        // NOT reliably live as long as the browser windows it's tracking do. background.js
+        // keeps a single chrome.runtime.connectNative connection open only for as long as the
+        // extension's MV3 service worker is alive, which closes the native-messaging port and
+        // kills THIS process the moment it isn't - and background.js's own periodic keepalive
+        // ping (see getNativePort/ensureKeepAlive) only staves that off for as long as
+        // something keeps scheduling it, not forever. A browser restart, an extension
+        // reload/update, or any other gap where the service worker fully unloads (observed:
+        // debug logging confirmed the SAME process surviving a full 6+ minutes of keepalive
+        // pings, so this is NOT a simple "every 30 idle seconds" problem in the common case -
+        // it bites across those less frequent but very real restart boundaries instead) all
+        // respawn a brand new process with this dictionary empty again, even though the
+        // dedicated Chrome instance and every isolated window it owns kept right on running
+        // the whole time. A window opened hours or days ago - exactly the kind that's actually
+        // sitting on an expired session when the user comes back to it - has almost certainly
+        // outlived the process that originally registered it. PersistProfileWindowsToDisk/
+        // LoadPersistedProfileWindows/ReconcileProfileWindowsFromDiskAsync below exist
+        // specifically to survive that: every registration is also written to
+        // ProfileWindowsFile, and a later process reconciles its own empty-or-partial map
+        // against it - but only for windowIds a live CDP check confirms are still actually
+        // open right now, so a stale entry for a long-closed window (or a same-numbered
+        // window in some later, fully-restarted dedicated instance) can never be revived.
         private static readonly ConcurrentDictionary<int, ProfileWindowIdentity> _profileWindows =
             new ConcurrentDictionary<int, ProfileWindowIdentity>();
+
+        // Where RegisterProfileWindowAsync persists _profileWindows so a later host process
+        // (see the long comment above) can recover it. Same root folder as cdp-port.txt/
+        // profile-labels.json (ChromeManager.cs's own RootDir) - not shared from there
+        // directly since CdpClient.cs has never touched disk before this and keeping its own
+        // copy of the literal avoids a cross-file coupling for one shared constant.
+        private static readonly string RootDir =
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AWS-Login-Helper-Host-Chrome");
+        private static readonly string ProfileWindowsFile = Path.Combine(RootDir, "profile-windows.json");
+        private static readonly object ProfileWindowsFileLock = new object();
 
         // One watcher loop per shared-instance port (not per target - see doc comment above).
         private static readonly ConcurrentDictionary<int, CancellationTokenSource> _instanceWatchers =
@@ -460,6 +518,81 @@ namespace AwsLoginHelperHost
             new ConcurrentDictionary<string, string>();
         private static readonly ConcurrentDictionary<string, int> _windowIdByTarget =
             new ConcurrentDictionary<string, int>();
+
+        // The exact title value RunInstanceWatcherLoopAsync last acted on for a given target,
+        // so the FIRST time the injected "signed out" note appears, this profile's stale
+        // console-session cookies get cleared exactly ONCE - without this, the marker would
+        // get reprocessed (clearing cookies again for no reason) on every single 1.5s poll
+        // tick for as long as the page keeps sitting on that same expired document.
+        private static readonly ConcurrentDictionary<string, string> _lastHandledSignedOutTitleByTarget =
+            new ConcurrentDictionary<string, string>();
+
+        // document.title is the only channel the injected banner script has back to this
+        // process at all once a window's session has expired - the dedicated, extension-less
+        // instance has no extension loaded in it to call chrome.runtime.sendMessage on, so the
+        // script can only ever set something CDP's own /json/list already exposes (title, like
+        // url) and wait for RunInstanceWatcherLoopAsync's next poll tick to notice it. Set once,
+        // the FIRST time BuildConsoleBannerScript's checkForSignedOutNote actually shows the
+        // note (guarded by that function's own idempotency check, same as the note element
+        // itself) - this one fires once per expiry, not on the later click (see
+        // ReauthClickTitleMarkerPrefix below for that). All this marker does is tell the host
+        // "this window's session just expired, go clear its stale cookies now", so that by the
+        // time the user eventually clicks the note's link, this profile's cookie jar is clean -
+        // no stale leftovers to confuse AWS's federation handshake into rejecting it.
+        private const string SignedOutTitleMarkerPrefix = "__awslh_signed_out__";
+
+        // Separate dedupe map, same reasoning as _lastHandledSignedOutTitleByTarget just above -
+        // ReauthClickTitleMarkerPrefix (below) is its own distinct one-shot signal and needs its
+        // own "have I already acted on this exact title value" guard, independent of the
+        // signed-out one (a window can see both markers in sequence: expire, then get clicked).
+        private static readonly ConcurrentDictionary<string, string> _lastHandledReauthClickTitleByTarget =
+            new ConcurrentDictionary<string, string>();
+
+        // Set by the injected note's "Click here to sign back in" link's own click handler
+        // (BuildConsoleBannerScript) instead of letting the click navigate directly - confirmed
+        // by testing that a plain navigation on click was landing back on AWS's sign-in page
+        // even after SignedOutTitleMarkerPrefix's cookie-clear and a subsequent portal-reload
+        // sync: the .awsapps.com cookie that sync delivers can go stale by the time the user
+        // gets around to clicking (the new-window open flow, by contrast, sets a cookie and
+        // navigates within the same CDP session less than a second apart - proven to work
+        // reliably). This marker is this process's only signal that the link was clicked at
+        // all, for the same reason SignedOutTitleMarkerPrefix exists: no extension runs in the
+        // dedicated, extension-less instance to call chrome.runtime.sendMessage on. On seeing
+        // this marker, ReauthenticateProfileWindowAsync re-sets the LAST cookie set this
+        // process has seen from ANY sync/open (see _lastKnownAwsAppsCookies below) and
+        // immediately Page.navigates this same target to the federation URL, mirroring the
+        // new-window flow's tight set-then-navigate timing instead of relying on however long
+        // ago the portal last happened to reload. Deliberately NOT a live round-trip back to
+        // the extension for an even-fresher cookie - asked and confirmed: reuse whatever was
+        // last seen, since there is no channel to ask for one on demand anyway other than the
+        // extension's own existing, independently-timed portal-reload sync.
+        private const string ReauthClickTitleMarkerPrefix = "__awslh_reauth_click__";
+
+        // The most recent .awsapps.com cookie set seen from ANY source - SyncCookiesToOpen
+        // ProfileWindowsAsync (portal reload) or SetCookiesAndNavigateAsync (opening/forwarding
+        // into a profile) both update this as a side effect of cookies they were already
+        // handling, purely so ReauthenticateProfileWindowAsync (above) has something to reuse
+        // without needing its own fetch. Guarded by a lock since the instance watcher loop
+        // (reading it) and request handling (writing it) run concurrently.
+        private static readonly object _lastKnownAwsAppsCookiesLock = new object();
+        private static List<CookieDto> _lastKnownAwsAppsCookies = new List<CookieDto>();
+
+        private static void UpdateLastKnownAwsAppsCookies(List<CookieDto> cookies)
+        {
+            if (cookies == null || cookies.Count == 0) return;
+            lock (_lastKnownAwsAppsCookiesLock)
+            {
+                _lastKnownAwsAppsCookies = cookies;
+            }
+        }
+
+        private static List<CookieDto> GetLastKnownAwsAppsCookies()
+        {
+            lock (_lastKnownAwsAppsCookiesLock)
+            {
+                return _lastKnownAwsAppsCookies;
+            }
+        }
 
         private static readonly TimeSpan InstanceWatcherPollInterval = TimeSpan.FromSeconds(1.5);
         private static readonly TimeSpan InstanceWatcherPostNavigationDelay = TimeSpan.FromMilliseconds(500);
@@ -499,7 +632,7 @@ namespace AwsLoginHelperHost
         public async Task RegisterProfileWindowAsync(
             int port, string targetId, Stream stdout,
             string profileKey, string accountId, string accountName, string roleName,
-            string displayLabel, string titleLabel, string initialUrl)
+            string displayLabel, string titleLabel, string initialUrl, string portalBaseUrl = null)
         {
             if (string.IsNullOrEmpty(targetId)) return;
 
@@ -521,9 +654,11 @@ namespace AwsLoginHelperHost
                         RoleName = roleName,
                         DisplayLabel = displayLabel,
                         TitleLabel = titleLabel,
+                        PortalBaseUrl = portalBaseUrl,
                     };
                     _windowIdByTarget[targetId] = windowId.Value;
                     Logger.Log($"RegisterProfileWindowAsync[{profileKey}]: windowId={windowId.Value}");
+                    PersistProfileWindowsToDisk();
                 }
             }
             catch (Exception ex)
@@ -533,6 +668,162 @@ namespace AwsLoginHelperHost
 
             _lastSeenUrlByTarget[targetId] = initialUrl;
             StartInstanceWatcher(port, stdout);
+        }
+
+        /// <summary>
+        /// Writes the WHOLE current _profileWindows snapshot to ProfileWindowsFile, overwriting
+        /// whatever was there. Called after every successful registration (see
+        /// RegisterProfileWindowAsync above) so a later host process - see that field's own doc
+        /// comment on why this process doesn't outlive the windows it tracks - can recover this
+        /// window's identity via ReconcileProfileWindowsFromDiskAsync below. Deliberately a full
+        /// rewrite, not an append: registrations are rare (once per window open, not per poll
+        /// tick) and _profileWindows is never large enough for this to matter. Known, accepted
+        /// gap: entries for windows that later get closed are never pruned from this file (the
+        /// in-memory dictionary itself has never pruned closed windows either - see its own
+        /// history), so it grows slowly, unboundedly, over a very long-lived installation; each
+        /// entry is a handful of short strings, so even years of daily use stays trivial in size.
+        /// Best-effort - a failure to write here must never fail the registration itself.
+        /// </summary>
+        private static void PersistProfileWindowsToDisk()
+        {
+            try
+            {
+                var array = new JArray();
+                foreach (var entry in _profileWindows)
+                {
+                    array.Add(new JObject
+                    {
+                        ["windowId"] = entry.Key,
+                        ["profileKey"] = entry.Value.ProfileKey,
+                        ["accountId"] = entry.Value.AccountId,
+                        ["accountName"] = entry.Value.AccountName,
+                        ["roleName"] = entry.Value.RoleName,
+                        ["displayLabel"] = entry.Value.DisplayLabel,
+                        ["titleLabel"] = entry.Value.TitleLabel,
+                        ["portalBaseUrl"] = entry.Value.PortalBaseUrl,
+                    });
+                }
+
+                lock (ProfileWindowsFileLock)
+                {
+                    Directory.CreateDirectory(RootDir);
+                    File.WriteAllText(ProfileWindowsFile, array.ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"PersistProfileWindowsToDisk: failed (non-fatal) - {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Reads ProfileWindowsFile back into a plain windowId -> identity map. Never throws -
+        /// a missing or corrupt file (e.g. from an interrupted write) just means "nothing to
+        /// recover," same as if this process had never lost its in-memory state at all.
+        /// </summary>
+        private static Dictionary<int, ProfileWindowIdentity> LoadPersistedProfileWindows()
+        {
+            var result = new Dictionary<int, ProfileWindowIdentity>();
+            try
+            {
+                string text;
+                lock (ProfileWindowsFileLock)
+                {
+                    if (!File.Exists(ProfileWindowsFile)) return result;
+                    text = File.ReadAllText(ProfileWindowsFile);
+                }
+
+                foreach (var token in JArray.Parse(text))
+                {
+                    int? windowId = (int?)token["windowId"];
+                    if (windowId == null) continue;
+                    result[windowId.Value] = new ProfileWindowIdentity
+                    {
+                        ProfileKey = (string)token["profileKey"],
+                        AccountId = (string)token["accountId"],
+                        AccountName = (string)token["accountName"],
+                        RoleName = (string)token["roleName"],
+                        DisplayLabel = (string)token["displayLabel"],
+                        TitleLabel = (string)token["titleLabel"],
+                        PortalBaseUrl = (string)token["portalBaseUrl"],
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"LoadPersistedProfileWindows: failed (non-fatal, treated as empty) - {ex.Message}");
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Recovers _profileWindows/_windowIdByTarget entries this process never saw get
+        /// registered itself, for windows that are still genuinely open right now - see
+        /// _profileWindows's own doc comment for why that gap exists at all. Call this before
+        /// anything that reads _profileWindows and needs it to reflect windows opened by an
+        /// earlier host process generation (today: just SyncCookiesToOpenProfileWindowsAsync).
+        ///
+        /// Two steps: (1) ask the dedicated instance which windowIds are ACTUALLY open right
+        /// now, by resolving the window for every current page target this process doesn't
+        /// already have a target->window mapping for (same Browser.getWindowForTarget call
+        /// RegisterProfileWindowAsync itself uses) - this also opportunistically repairs
+        /// _windowIdByTarget for a window whose only previously-known target has since closed
+        /// (e.g. the user closed the original console tab but left a service tab open in the
+        /// same window). (2) for any of those confirmed-live windowIds this process doesn't
+        /// already have an identity for, pull it in from disk - but ONLY if step 1 just
+        /// confirmed it's live, so a stale disk entry for a long-closed window, or for a
+        /// same-numbered window in some later, fully-restarted dedicated instance, can never
+        /// be revived into a wrong or dangling identity.
+        /// </summary>
+        private async Task ReconcileProfileWindowsFromDiskAsync(int port)
+        {
+            List<(string Id, string Url, string Title)> targets;
+            try
+            {
+                targets = await ListPageTargetsAsync(port);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"ReconcileProfileWindowsFromDiskAsync: ListPageTargetsAsync failed (non-fatal) - {ex.Message}");
+                return;
+            }
+
+            var liveWindowIds = new HashSet<int>();
+            foreach (var target in targets)
+            {
+                if (_windowIdByTarget.TryGetValue(target.Id, out int knownWindowId))
+                {
+                    liveWindowIds.Add(knownWindowId);
+                    continue;
+                }
+
+                try
+                {
+                    string wsUrl = await GetWebSocketUrlAsync(port, target.Id);
+                    int? windowId = await ResolveWindowIdAsync(wsUrl);
+                    if (windowId == null) continue;
+                    _windowIdByTarget[target.Id] = windowId.Value;
+                    liveWindowIds.Add(windowId.Value);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"ReconcileProfileWindowsFromDiskAsync: could not resolve windowId for target {target.Id} (non-fatal) - {ex.Message}");
+                }
+            }
+
+            // Common case (this process already knows every live window - either it registered
+            // them itself, or a previous reconcile already recovered them): nothing new to do,
+            // and no reason to pay for reading the file at all.
+            if (liveWindowIds.Count == 0 || liveWindowIds.All(id => _profileWindows.ContainsKey(id))) return;
+
+            foreach (var entry in LoadPersistedProfileWindows())
+            {
+                if (liveWindowIds.Contains(entry.Key) && !_profileWindows.ContainsKey(entry.Key))
+                {
+                    _profileWindows[entry.Key] = entry.Value;
+                    Logger.Log($"ReconcileProfileWindowsFromDiskAsync: [{entry.Value.ProfileKey}] recovered windowId={entry.Key} after a host process restart");
+                }
+            }
         }
 
         private void StartInstanceWatcher(int port, Stream stdout)
@@ -556,7 +847,7 @@ namespace AwsLoginHelperHost
                 {
                     await Task.Delay(InstanceWatcherPollInterval, ct);
 
-                    List<(string Id, string Url)> targets;
+                    List<(string Id, string Url, string Title)> targets;
                     try
                     {
                         targets = await ListPageTargetsAsync(port);
@@ -575,7 +866,7 @@ namespace AwsLoginHelperHost
                         return;
                     }
 
-                    foreach (var (targetId, url) in targets)
+                    foreach (var (targetId, url, title) in targets)
                     {
                         if (string.IsNullOrEmpty(url)) continue;
 
@@ -603,11 +894,81 @@ namespace AwsLoginHelperHost
                                     Logger.Log($"InstanceWatcher[port {port}]: [{knownIdentity.ProfileKey}] banner missing on an unchanged url (likely a refresh) -> reinjecting");
                                     try
                                     {
-                                        await ReinjectBannerAsync(port, targetId, knownIdentity.DisplayLabel, knownIdentity.TitleLabel);
+                                        await ReinjectBannerAsync(port, targetId, knownIdentity.DisplayLabel, knownIdentity.TitleLabel, knownIdentity.AccountId, knownIdentity.RoleName, knownIdentity.PortalBaseUrl);
                                     }
                                     catch (Exception ex)
                                     {
                                         Logger.LogError($"InstanceWatcher[port {port}]: reinject-after-refresh failed (non-fatal) - {ex}");
+                                    }
+                                }
+                            }
+
+                            // Same-url is also the only shape either of the injected note's two
+                            // one-shot title markers ever takes - BuildConsoleBannerScript's page
+                            // JS has no other way to signal this process at all (no extension runs
+                            // in this dedicated instance for chrome.runtime.sendMessage), so both
+                            // SignedOutTitleMarkerPrefix (note first appears -> clear stale
+                            // cookies) and ReauthClickTitleMarkerPrefix (link clicked -> set the
+                            // last-known cookie and navigate, right below) rely on document.title
+                            // and this same poll tick to be noticed at all.
+                            // Contains, not StartsWith: ensureTitle() (in BuildConsoleBannerScript's
+                            // JS) re-prepends TITLE_PREFIX on top of whatever document.title already
+                            // holds on its very next apply() tick (every <=250ms), so by the time
+                            // this poll (every 1.5s) observes it, the marker set by
+                            // checkForSignedOutNote is very likely no longer at index 0.
+                            if (!string.IsNullOrEmpty(title) &&
+                                title.Contains(SignedOutTitleMarkerPrefix) &&
+                                _lastHandledSignedOutTitleByTarget.GetOrAdd(targetId, string.Empty) != title)
+                            {
+                                _lastHandledSignedOutTitleByTarget[targetId] = title;
+                                if (_windowIdByTarget.TryGetValue(targetId, out int signedOutWindowId) &&
+                                    _profileWindows.TryGetValue(signedOutWindowId, out var signedOutIdentity))
+                                {
+                                    Logger.Log($"InstanceWatcher[port {port}]: [{signedOutIdentity.ProfileKey}] session expired -> clearing stale cookies");
+                                    try
+                                    {
+                                        await ClearStaleSessionCookiesAsync(port, targetId);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Logger.LogError($"InstanceWatcher[port {port}]: [{signedOutIdentity.ProfileKey}] clearing stale cookies failed (non-fatal) - {ex}");
+                                    }
+                                }
+                            }
+
+                            // See ReauthClickTitleMarkerPrefix's own doc comment for why this
+                            // exists at all (a plain navigation on click was proven, by testing,
+                            // to land on AWS's sign-in page even after a successful clear +
+                            // portal-reload sync - the cookie that sync delivered can go stale by
+                            // the time the user gets around to clicking). url here is this same
+                            // target's own current location, already read this same poll tick -
+                            // exactly what checkForSignedOutNote's own client-side link-builder
+                            // used as "destination", so rebuilding it host-side from the same
+                            // three pieces (identity.PortalBaseUrl/AccountId/RoleName) plus this
+                            // url reproduces the identical federation URL.
+                            if (!string.IsNullOrEmpty(title) &&
+                                title.Contains(ReauthClickTitleMarkerPrefix) &&
+                                _lastHandledReauthClickTitleByTarget.GetOrAdd(targetId, string.Empty) != title)
+                            {
+                                _lastHandledReauthClickTitleByTarget[targetId] = title;
+                                if (_windowIdByTarget.TryGetValue(targetId, out int reauthWindowId) &&
+                                    _profileWindows.TryGetValue(reauthWindowId, out var reauthIdentity) &&
+                                    !string.IsNullOrEmpty(reauthIdentity.PortalBaseUrl) &&
+                                    !string.IsNullOrEmpty(reauthIdentity.AccountId) &&
+                                    !string.IsNullOrEmpty(reauthIdentity.RoleName))
+                                {
+                                    string reauthUrl = reauthIdentity.PortalBaseUrl + "#/console?account_id=" +
+                                        Uri.EscapeDataString(reauthIdentity.AccountId) + "&role_name=" +
+                                        Uri.EscapeDataString(reauthIdentity.RoleName) + "&destination=" +
+                                        Uri.EscapeDataString(url);
+                                    Logger.Log($"InstanceWatcher[port {port}]: [{reauthIdentity.ProfileKey}] reauth link clicked -> setting cached cookie and navigating");
+                                    try
+                                    {
+                                        await ReauthenticateProfileWindowAsync(port, targetId, reauthUrl, reauthIdentity.DisplayLabel, reauthIdentity.TitleLabel, reauthIdentity.AccountId, reauthIdentity.RoleName, reauthIdentity.PortalBaseUrl);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        Logger.LogError($"InstanceWatcher[port {port}]: [{reauthIdentity.ProfileKey}] reauth-on-click failed (non-fatal) - {ex}");
                                     }
                                 }
                             }
@@ -647,7 +1008,7 @@ namespace AwsLoginHelperHost
                             // retries and sets up MutationObservers, so this just avoids the
                             // most common case of injecting into a not-yet-parsed document.
                             await Task.Delay(InstanceWatcherPostNavigationDelay, ct);
-                            await ReinjectBannerAsync(port, targetId, identity.DisplayLabel, identity.TitleLabel);
+                            await ReinjectBannerAsync(port, targetId, identity.DisplayLabel, identity.TitleLabel, identity.AccountId, identity.RoleName, identity.PortalBaseUrl);
                         }
                         catch (Exception ex)
                         {
@@ -724,7 +1085,7 @@ namespace AwsLoginHelperHost
         /// eligibility beyond the same brief window SetCookiesAndNavigateAsync's own injection
         /// already uses.
         /// </summary>
-        private async Task ReinjectBannerAsync(int port, string targetId, string bannerLabel, string titleLabel)
+        private async Task ReinjectBannerAsync(int port, string targetId, string bannerLabel, string titleLabel, string accountId = null, string roleName = null, string portalBaseUrl = null)
         {
             string wsUrl = await GetWebSocketUrlAsync(port, targetId);
             using (var ws = new ClientWebSocket())
@@ -738,7 +1099,7 @@ namespace AwsLoginHelperHost
                 // assumed cookie name and why it has to be read this way at all.
                 double? sessionExpiry = await TryGetCookieExpiryAsync(ws, 1, SessionCookieName);
 
-                string script = BuildConsoleBannerScript(bannerLabel, string.IsNullOrEmpty(titleLabel) ? bannerLabel : titleLabel, sessionExpiry);
+                string script = BuildConsoleBannerScript(bannerLabel, string.IsNullOrEmpty(titleLabel) ? bannerLabel : titleLabel, sessionExpiry, accountId, roleName, portalBaseUrl);
                 await SendAndAwaitAsync(ws, 2, "Runtime.evaluate", new JObject { ["expression"] = script });
 
                 if (ws.State == WebSocketState.Open)
@@ -787,6 +1148,294 @@ namespace AwsLoginHelperHost
             catch
             {
                 return true; // see doc comment above - never let a check failure force a reinject
+            }
+        }
+
+        /// <summary>
+        /// Pushes a freshly re-authenticated set of .awsapps.com cookies into every isolated
+        /// profile that currently has a window open - and ONLY those. This is deliberately
+        /// narrower than the older, now button-only "syncAllProfiles" path (see
+        /// Program.HandleSyncAllProfiles), which loops through every profile ever created on
+        /// disk and briefly opens/closes a tab in each one just to set its cookie - fine for an
+        /// explicit, occasional "sync all" click, but content.js used to also fire that on
+        /// every single portal page load and it was reverted: once more than a couple of
+        /// profiles exist, that looked like a burst of blank windows opening and closing every
+        /// time the portal page loaded. This version never opens or closes anything - it only
+        /// touches a window the user ALREADY has open right now, by reusing one of its existing
+        /// CDP targets (any tab in that window works; Network.setCookie lands in the profile's
+        /// shared cookie jar either way), so there is nothing new for the user to see. The
+        /// point is purely to let an already-open isolated console window be refreshed by hand
+        /// (F5) after the portal session was renewed, instead of silently failing AWS's own
+        /// session-refresh redirect because it's still holding the stale cookie from whenever
+        /// that window was first opened.
+        ///
+        /// Best-effort per profile - one profile failing to sync (e.g. its one known target
+        /// closed between the last watcher tick and now) must never stop the others. Returns
+        /// how many profiles were actually synced, purely for logging/diagnostics.
+        /// </summary>
+        public async Task<int> SyncCookiesToOpenProfileWindowsAsync(int port, List<CookieDto> cookies)
+        {
+            if (cookies == null || cookies.Count == 0) return 0;
+            UpdateLastKnownAwsAppsCookies(cookies);
+
+            // Recover any windows this process never saw get registered itself before relying
+            // on _profileWindows - see its own doc comment, and ReconcileProfileWindowsFromDisk
+            // Async's, for why that gap exists and is exactly what used to make this method a
+            // silent no-op for a window opened by an earlier host process generation.
+            await ReconcileProfileWindowsFromDiskAsync(port);
+
+            // _windowIdByTarget can hold several targets for the same window (e.g. the console
+            // tab plus a service tab the user opened by hand) - any one of them works, so just
+            // keep the first target seen per windowId.
+            var targetIdByWindowId = new Dictionary<int, string>();
+            foreach (var entry in _windowIdByTarget)
+            {
+                if (!targetIdByWindowId.ContainsKey(entry.Value)) targetIdByWindowId[entry.Value] = entry.Key;
+            }
+
+            int synced = 0;
+            foreach (var entry in _profileWindows)
+            {
+                int windowId = entry.Key;
+                ProfileWindowIdentity identity = entry.Value;
+                if (!targetIdByWindowId.TryGetValue(windowId, out string targetId)) continue; // not open right now
+
+                try
+                {
+                    int succeededCount = await SetCookiesOnlyAsync(port, targetId, cookies);
+                    synced++;
+                    // succeededCount can be LESS than cookies.Count - see SetCookiesOnlyAsync's
+                    // own doc comment on Network.setCookie's silent result.success=false case.
+                    // Logging both numbers here (instead of just assuming cookies.Count, as this
+                    // used to) is what would have caught x-amz-sso_authn silently failing to land
+                    // while everything else in the batch succeeded.
+                    Logger.Log($"SyncCookiesToOpenProfileWindowsAsync: [{identity.ProfileKey}] synced {succeededCount}/{cookies.Count} cookie(s)");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"SyncCookiesToOpenProfileWindowsAsync: [{identity.ProfileKey}] failed (non-fatal) - {ex.Message}");
+                }
+            }
+            return synced;
+        }
+
+        /// <summary>
+        /// Sets cookies on an already-open target and nothing else - no navigation, no banner,
+        /// no window focus. Same brief connect/evaluate/disconnect shape as
+        /// ResolveWindowIdAsync/IsBannerPresentAsync above, and the same Network.setCookie
+        /// parameter mapping SetCookiesAndNavigateAsync uses (kept as its own small copy here,
+        /// not shared, since that method does a lot more than this and is sensitive enough to
+        /// leave alone - see its own doc comment history in CdpClient.cs).
+        /// </summary>
+        private async Task<int> SetCookiesOnlyAsync(int port, string targetId, List<CookieDto> cookies)
+        {
+            int succeeded = 0;
+            string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+            using (var ws = new ClientWebSocket())
+            {
+                ws.Options.Proxy = null;
+                await ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+
+                int nextId = 1;
+                foreach (var cookie in cookies)
+                {
+                    var parms = new JObject
+                    {
+                        ["name"] = cookie.Name,
+                        ["value"] = cookie.Value,
+                        ["domain"] = cookie.Domain,
+                        ["path"] = string.IsNullOrEmpty(cookie.Path) ? "/" : cookie.Path,
+                        ["secure"] = cookie.Secure,
+                        ["httpOnly"] = cookie.HttpOnly,
+                    };
+
+                    if (!string.IsNullOrEmpty(cookie.SameSite))
+                    {
+                        parms["sameSite"] = cookie.SameSite.Equals("no_restriction", StringComparison.OrdinalIgnoreCase)
+                            ? "None"
+                            : char.ToUpperInvariant(cookie.SameSite[0]) + cookie.SameSite.Substring(1);
+                    }
+
+                    if (cookie.Session != true && cookie.ExpirationDate.HasValue)
+                    {
+                        parms["expires"] = cookie.ExpirationDate.Value;
+                    }
+
+                    // IMPORTANT: Network.setCookie can come back as a perfectly normal,
+                    // successful CDP response (no "error" field - SendAndAwaitAsync would never
+                    // throw for this) while still reporting result.success == false, which means
+                    // Chrome itself silently REFUSED to store the cookie (e.g. Secure/SameSite
+                    // mismatch, an invalid domain for this cookie's name/prefix, or similar). This
+                    // used to go completely unnoticed - the caller always saw "synced N cookie(s)"
+                    // regardless of whether any individual cookie actually landed, which is
+                    // exactly the kind of silent failure that made a missing x-amz-sso_authn
+                    // cookie (the one that actually matters for federation) indistinguishable from
+                    // a successful sync in the logs. Check and log it explicitly instead.
+                    JObject response = await SendAndAwaitAsync(ws, nextId++, "Network.setCookie", parms);
+                    bool success = (bool?)response?["result"]?["success"] ?? false;
+                    if (success)
+                    {
+                        succeeded++;
+                    }
+                    else
+                    {
+                        Logger.LogError($"SetCookiesOnlyAsync: Chrome REJECTED cookie [{cookie.Name}] domain={cookie.Domain} path={parms["path"]} secure={cookie.Secure} sameSite={(string)parms["sameSite"]} - result.success=false (no CDP-level error)");
+                    }
+                }
+
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+                }
+            }
+            return succeeded;
+        }
+
+        /// <summary>
+        /// Clears every cookie for the profile that owns this target - no cookie-setting, no
+        /// navigation, nothing else. Same brief connect/evaluate/disconnect shape as
+        /// SetCookiesOnlyAsync just above. Called exactly once per session-expiry, from
+        /// RunInstanceWatcherLoopAsync's title-marker detection, to get rid of the stale
+        /// leftover console.aws.amazon.com-domain cookies (aws-creds, aws-userInfo, the
+        /// noflush_* family, etc.) that a prior sign-in left behind in this profile and that a
+        /// fresh federation attempt was found to conflict with (see this file's own notes on
+        /// the DevTools cookie comparison that led here). Network.clearBrowserCookies, issued
+        /// over a CDP session attached to a page in THIS profile's own window, clears only that
+        /// profile's own cookie jar - the same per-profile scoping SetCookiesOnlyAsync already
+        /// relies on - never the user's real browser profile or any other isolated profile's
+        /// window.
+        /// </summary>
+        private async Task ClearStaleSessionCookiesAsync(int port, string targetId)
+        {
+            string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+            using (var ws = new ClientWebSocket())
+            {
+                ws.Options.Proxy = null;
+                await ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+
+                await SendAndAwaitAsync(ws, 1, "Network.clearBrowserCookies", new JObject());
+
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Fired exactly once per ReauthClickTitleMarkerPrefix detection (see that constant's
+        /// own doc comment for the full reasoning) - sets the LAST cookie set this process has
+        /// seen from any sync/open (GetLastKnownAwsAppsCookies) on this target, then immediately
+        /// Page.navigates this SAME target to the federation URL. The whole point of this method
+        /// existing at all is that SyncCookiesToOpenProfileWindowsAsync's cookie delivery and the
+        /// user's own, unpredictable click timing could be minutes apart, long enough for a
+        /// short-lived cookie to go stale before a plain link click would have used it.
+        ///
+        /// Structurally this now mirrors SetCookiesAndNavigateAsync's proven sequence end to end
+        /// (Page.enable -> set cookies -> Page.addScriptToEvaluateOnNewDocument -> Page.navigate
+        /// -> WaitForConsoleNavigationAsync before disconnecting) rather than the bare "set
+        /// cookies, Page.navigate, disconnect immediately" this originally shipped with - real
+        /// testing of that first version showed two concrete failures, both traceable straight
+        /// back to SetCookiesAndNavigateAsync's own doc comments on why each of these steps is
+        /// there at all:
+        ///   1. No banner on the window that eventually DID authenticate - because nothing ever
+        ///      registered BuildConsoleBannerScript via Page.addScriptToEvaluateOnNewDocument for
+        ///      this navigation, so none of AWS's federation redirect hops (nor the final
+        ///      console.aws.amazon.com landing) ever got it injected.
+        ///   2. Disconnecting the WebSocket immediately after Page.navigate detaches the CDP
+        ///      session - and with it, any Page.addScriptToEvaluateOnNewDocument registration -
+        ///      while AWS's federation redirect chain (observed taking 9+ seconds) was still in
+        ///      flight, which is the exact same "script already gone by the time the real page
+        ///      loaded" failure SetCookiesAndNavigateAsync's own doc comment describes hitting
+        ///      for the original open-a-new-window path before it added the
+        ///      WaitForConsoleNavigationAsync wait below.
+        ///
+        /// Cookie-setting here is its OWN small copy of the same Network.setCookie loop/mapping
+        /// used elsewhere (SetCookiesOnlyAsync, SetCookiesAndNavigateAsync) rather than a shared
+        /// helper - consistent with this file's existing practice of not sharing that loop
+        /// between methods (see SetCookiesOnlyAsync's own doc comment on why).
+        /// </summary>
+        private async Task ReauthenticateProfileWindowAsync(int port, string targetId, string reauthUrl, string bannerLabel, string titleLabel, string accountId, string roleName, string portalBaseUrl)
+        {
+            List<CookieDto> cookies = GetLastKnownAwsAppsCookies();
+            if (cookies == null || cookies.Count == 0)
+            {
+                Logger.LogError("ReauthenticateProfileWindowAsync: no cached .awsapps.com cookies seen yet this process - navigating anyway, but federation will likely fail without one. Sign back into the portal first.");
+            }
+
+            string wsUrl = await GetWebSocketUrlAsync(port, targetId);
+            using (var ws = new ClientWebSocket())
+            {
+                ws.Options.Proxy = null;
+                await ws.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+
+                int nextId = 1;
+
+                // Needed for WaitForConsoleNavigationAsync's Page.frameNavigated events below -
+                // see SetCookiesAndNavigateAsync's own Page.enable call for the same reasoning.
+                await SendAndAwaitAsync(ws, nextId++, "Page.enable", new JObject());
+
+                foreach (var cookie in cookies ?? new List<CookieDto>())
+                {
+                    var parms = new JObject
+                    {
+                        ["name"] = cookie.Name,
+                        ["value"] = cookie.Value,
+                        ["domain"] = cookie.Domain,
+                        ["path"] = string.IsNullOrEmpty(cookie.Path) ? "/" : cookie.Path,
+                        ["secure"] = cookie.Secure,
+                        ["httpOnly"] = cookie.HttpOnly,
+                    };
+
+                    if (!string.IsNullOrEmpty(cookie.SameSite))
+                    {
+                        parms["sameSite"] = cookie.SameSite.Equals("no_restriction", StringComparison.OrdinalIgnoreCase)
+                            ? "None"
+                            : char.ToUpperInvariant(cookie.SameSite[0]) + cookie.SameSite.Substring(1);
+                    }
+
+                    if (cookie.Session != true && cookie.ExpirationDate.HasValue)
+                    {
+                        parms["expires"] = cookie.ExpirationDate.Value;
+                    }
+
+                    JObject response = await SendAndAwaitAsync(ws, nextId++, "Network.setCookie", parms);
+                    bool success = (bool?)response?["result"]?["success"] ?? false;
+                    if (!success)
+                    {
+                        Logger.LogError($"ReauthenticateProfileWindowAsync: Chrome REJECTED cookie [{cookie.Name}] domain={cookie.Domain} path={parms["path"]} secure={cookie.Secure} sameSite={(string)parms["sameSite"]} - result.success=false (no CDP-level error)");
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(bannerLabel))
+                {
+                    string script = BuildConsoleBannerScript(bannerLabel, string.IsNullOrEmpty(titleLabel) ? bannerLabel : titleLabel, null, accountId, roleName, portalBaseUrl);
+                    await SendAndAwaitAsync(ws, nextId++, "Page.addScriptToEvaluateOnNewDocument", new JObject { ["source"] = script });
+                }
+
+                await SendAndAwaitAsync(ws, nextId++, "Page.navigate", new JObject { ["url"] = reauthUrl });
+                Logger.Log($"ReauthenticateProfileWindowAsync: set {cookies?.Count ?? 0} cached cookie(s) and navigated -> {reauthUrl}");
+
+                // Stay attached until AWS's federation redirect chain actually settles on
+                // console.aws.amazon.com (or times out) - see this method's own doc comment
+                // and SetCookiesAndNavigateAsync's identical wait for why disconnecting any
+                // earlier would silently wipe out the addScriptToEvaluateOnNewDocument
+                // registration above before it ever gets a chance to run. Non-fatal: by the
+                // time this wait itself fails or times out, the real Page.navigate above has
+                // normally already gone through.
+                try
+                {
+                    await WaitForConsoleNavigationAsync(ws, TimeSpan.FromSeconds(20), TimeSpan.FromMilliseconds(1200));
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"ReauthenticateProfileWindowAsync: WaitForConsoleNavigationAsync failed (non-fatal): {ex}");
+                }
+
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+                }
             }
         }
 
@@ -1022,7 +1671,7 @@ namespace AwsLoginHelperHost
         /// way (window.__awslhExpiryIntervalId) so repeated re-runs never stack up more than
         /// one timer.
         /// </summary>
-        private static string BuildConsoleBannerScript(string bannerLabel, string titleLabel, double? sessionExpiryEpochSeconds = null)
+        private static string BuildConsoleBannerScript(string bannerLabel, string titleLabel, double? sessionExpiryEpochSeconds = null, string accountId = null, string roleName = null, string portalBaseUrl = null)
         {
             string jsonBannerLabel = Newtonsoft.Json.JsonConvert.SerializeObject(bannerLabel);
             string jsonTitleLabel = Newtonsoft.Json.JsonConvert.SerializeObject(titleLabel);
@@ -1030,6 +1679,14 @@ namespace AwsLoginHelperHost
             string jsSessionExpiryEpoch = sessionExpiryEpochSeconds.HasValue
                 ? sessionExpiryEpochSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)
                 : "null";
+            // Null/empty (a window opened before this field existed) becomes JS null, not "" -
+            // checkForSignedOutNote below uses that to fall back to plain-text guidance instead
+            // of trying to build a federation link out of missing pieces.
+            string jsonAccountId = string.IsNullOrEmpty(accountId) ? "null" : Newtonsoft.Json.JsonConvert.SerializeObject(accountId);
+            string jsonRoleName = string.IsNullOrEmpty(roleName) ? "null" : Newtonsoft.Json.JsonConvert.SerializeObject(roleName);
+            string jsonPortalBaseUrl = string.IsNullOrEmpty(portalBaseUrl) ? "null" : Newtonsoft.Json.JsonConvert.SerializeObject(portalBaseUrl);
+            string jsonSignedOutTitleMarkerPrefix = Newtonsoft.Json.JsonConvert.SerializeObject(SignedOutTitleMarkerPrefix);
+            string jsonReauthClickTitleMarkerPrefix = Newtonsoft.Json.JsonConvert.SerializeObject(ReauthClickTitleMarkerPrefix);
 
             string lower = bannerLabel.ToLowerInvariant();
             // Check "nonprod" BEFORE "prod": "NonProd" contains "prod" as a plain substring,
@@ -1052,6 +1709,15 @@ namespace AwsLoginHelperHost
   var COLOR = '" + color + @"';
   var SESSION_EXPIRY_EPOCH = " + jsSessionExpiryEpoch + @";
   var REVIEW_URL = " + jsonReviewUrl + @";
+  // These three are only ever all-present together (see BuildConsoleBannerScript's own
+  // doc comment) - a window opened before this field existed gets null for all three, and
+  // checkForSignedOutNote below falls back to plain-text F5 guidance in that case instead
+  // of trying to build a federation link out of missing pieces.
+  var ACCOUNT_ID = " + jsonAccountId + @";
+  var ROLE_NAME = " + jsonRoleName + @";
+  var PORTAL_BASE_URL = " + jsonPortalBaseUrl + @";
+  var SIGNED_OUT_TITLE_MARKER_PREFIX = " + jsonSignedOutTitleMarkerPrefix + @";
+  var REAUTH_CLICK_TITLE_MARKER_PREFIX = " + jsonReauthClickTitleMarkerPrefix + @";
 
   function ensureTitle() {
     if (document.title.indexOf(TITLE_PREFIX) !== 0) {
@@ -1154,6 +1820,123 @@ namespace AwsLoginHelperHost
     expirySpan.textContent = remainingSeconds > 0
       ? (' | Session expires in ' + formatDurationHM(remainingSeconds))
       : ' | Session expired';
+    checkForSignedOutNote(remainingSeconds <= 0);
+  }
+
+  // AWS's own console shows a ""You have been signed out"" modal (its own real-time signal,
+  // independent of our cookie-based countdown above) once the session has actually expired,
+  // offering a ""Sign in again"" button that signs back in DIRECTLY in this isolated profile -
+  // bypassing the portal page entirely, which means re-entering MFA right here instead of the
+  // one-click refresh this extension exists to provide. Only act once our own countdown has
+  // also reached zero (the expired argument from updateExpiryText above), so a transient
+  // false match on the modal's text can't fire this early.
+  //
+  // Matched by the modal's own VISIBLE TEXT, not its css-module class names (those are a
+  // build-time hash baked in by AWS's own frontend tooling - e.g. awsui_container_1d2i7_... -
+  // and can change on any AWS console deploy with no notice; the English copy it shows the
+  // user is far more stable to depend on here).
+  function checkForSignedOutNote(expired) {
+    if (!expired) return;
+    if (document.getElementById('awslh-signed-out-note')) return; // already shown this page
+
+    var headings = document.querySelectorAll('h1, h2, h3, [role=""heading""]');
+    var isSignedOutModalShowing = false;
+    for (var i = 0; i < headings.length; i++) {
+      if (/you have been signed out/i.test(headings[i].textContent || '')) {
+        isSignedOutModalShowing = true;
+        break;
+      }
+    }
+    if (!isSignedOutModalShowing) return;
+
+    var note = document.createElement('div');
+    note.id = 'awslh-signed-out-note';
+    // Fixed to the very top of the viewport (AWS's own modal is centered, so this never
+    // overlaps it) and the same max z-index the account/role banner below uses, so it sits
+    // above AWS's own modal backdrop rather than being dimmed out underneath it.
+    note.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;' +
+      'box-sizing:border-box;background:#ff9900;color:#000;text-align:center;' +
+      'padding:10px 16px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;';
+
+    // When this window's account/role link was captured (ACCOUNT_ID/ROLE_NAME/PORTAL_BASE_URL
+    // all present - see the doc comment on those vars above), build the federation URL, with
+    // 'destination' set to wherever this tab currently is so the portal lands the user back
+    // here. The href is set to it as a plain fallback (e.g. right-click -> open in new tab
+    // bypasses the click handler below entirely), but a normal click does NOT navigate
+    // directly - confirmed by testing that it still landed on AWS's own sign-in page even
+    // after a clean cookie-clear and a subsequent portal-reload sync, because the
+    // .awsapps.com cookie that sync delivers can go stale by the time the user actually gets
+    // around to clicking (there is no guaranteed upper bound on that gap). Instead, the click
+    // sets REAUTH_CLICK_TITLE_MARKER_PREFIX via document.title - the same kind of one-shot
+    // signal SIGNED_OUT_TITLE_MARKER_PREFIX below already relies on, since there's no
+    // extension in this instance to message directly - and the native host
+    // (ReauthenticateProfileWindowAsync) re-sets the LAST cookie it has seen from any
+    // sync/open on THIS target and immediately navigates it itself, mirroring the same tight
+    // set-then-navigate timing that already works reliably for brand new windows.
+    // Older windows (opened before this field existed) get null for all three and fall back to
+    // the original plain-text F5-via-portal guidance, since there's nothing to build a link from.
+    if (PORTAL_BASE_URL && ACCOUNT_ID && ROLE_NAME) {
+      var reauthUrl = PORTAL_BASE_URL + '#/console?account_id=' + encodeURIComponent(ACCOUNT_ID) +
+        '&role_name=' + encodeURIComponent(ROLE_NAME) +
+        '&destination=' + encodeURIComponent(window.location.href);
+      var header = document.createElement('div');
+      header.textContent = 'Note from AWS Login Helper Extension:';
+      note.appendChild(header);
+
+      var spacer1 = document.createElement('div');
+      spacer1.style.cssText = 'height:6px;';
+      note.appendChild(spacer1);
+
+      var bodyLine = document.createElement('div');
+      var textPrefix = document.createElement('span');
+      textPrefix.textContent = 'Your session has expired. Go to the AWS access portal page ' +
+        '(awsapps.com), sign in there, then come back here and ';
+      bodyLine.appendChild(textPrefix);
+      var reauthLink = document.createElement('a');
+      reauthLink.href = reauthUrl;
+      reauthLink.textContent = 'click here to sign back in';
+      reauthLink.style.cssText = 'color:#000;text-decoration:underline;';
+      reauthLink.addEventListener('click', function (event) {
+        event.preventDefault();
+        if (reauthLink.textContent !== 'Signing you in...') {
+          reauthLink.textContent = 'Signing you in...';
+          document.title = REAUTH_CLICK_TITLE_MARKER_PREFIX + Date.now();
+        }
+      });
+      bodyLine.appendChild(reauthLink);
+      var textSuffix = document.createElement('span');
+      textSuffix.textContent = ' to resume your work without re-auth.';
+      bodyLine.appendChild(textSuffix);
+      note.appendChild(bodyLine);
+
+      var spacer2 = document.createElement('div');
+      spacer2.style.cssText = 'height:6px;';
+      note.appendChild(spacer2);
+
+      var footer = document.createElement('div');
+      footer.textContent = '(Do not use AWS\'s own ""Sign in again"" button below - it only ' +
+        'signs you back in in THIS window)';
+      note.appendChild(footer);
+    } else {
+      note.textContent = 'Note from AWS Login Helper Extension: do not click ""Sign in again"" ' +
+        'below - it signs back in directly in this window instead of through the portal. Go to ' +
+        'the AWS access portal page and sign in there instead, then come back to this window ' +
+        'and refresh it (F5) to continue what you were doing.';
+    }
+    document.body.appendChild(note);
+
+    // One-shot signal back to the native host process: page JS in this dedicated,
+    // extension-less Chrome/Edge instance has no chrome.runtime.sendMessage available (no
+    // extension is loaded in it - see this file's own notes on why), so document.title is the
+    // only channel available at all. RunInstanceWatcherLoopAsync's existing 1.5s poll of
+    // /json/list already reads each target's title; a value starting with
+    // SIGNED_OUT_TITLE_MARKER_PREFIX is its cue to clear this profile's stale console-session
+    // cookies exactly once. Appending Date.now() keeps it unique per occurrence without the
+    // watcher needing to parse anything out of it. ensureTitle() above will likely re-prepend
+    // TITLE_PREFIX on top of this on its very next apply() tick, so the marker usually won't
+    // stay at index 0 - the host-side check matches on Contains, not StartsWith, for exactly
+    // this reason.
+    document.title = SIGNED_OUT_TITLE_MARKER_PREFIX + Date.now();
   }
 
   function apply() {

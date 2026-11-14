@@ -220,6 +220,46 @@ function serializeCookiesForHost(cookies) {
   }));
 }
 
+// Testing showed that polling chrome.cookies.getAll (via content.js's on-page-load trigger,
+// every time the portal page reloads) can go a full HOUR of being signed in without ever once
+// seeing x-amz-sso_authn - the one cookie the isolated windows' federation link actually needs.
+// That points to it existing only for a very brief instant (presumably right as the SSO
+// handshake completes, before the portal's own JS rotates or clears it) rather than sticking
+// around for the life of the session the way awsccc/loginCsrfToken do. A timer-based poll can
+// easily land entirely outside that window and simply never catch it, no matter how often it
+// runs. chrome.cookies.onChanged, by contrast, fires synchronously the instant the browser
+// actually commits a Set-Cookie for ANY .awsapps.com cookie - so hooking it (instead of relying
+// solely on content.js's page-load-triggered poll) is what gives this a real chance of
+// capturing x-amz-sso_authn at all, however short its lifetime turns out to be.
+//
+// Lightly debounced (500ms) since a single sign-in redirect can set several cookies back to
+// back - each would otherwise trigger its own, mostly-redundant full gather+push. The gather
+// itself (getAwsAppsCookies) always reads whatever is in the jar AT THE TIME the debounce timer
+// actually fires, so this still reliably includes a cookie that arrived and is still present at
+// that point, even if it wasn't the specific one that triggered the listener.
+let onCookieChangedDebounceTimer = null;
+
+chrome.cookies.onChanged.addListener((changeInfo) => {
+  if (changeInfo.removed) return;
+  const cookie = changeInfo.cookie;
+  if (!cookie || !cookie.domain || !cookie.domain.includes('awsapps.com')) return;
+
+  if (onCookieChangedDebounceTimer) clearTimeout(onCookieChangedDebounceTimer);
+  onCookieChangedDebounceTimer = setTimeout(() => {
+    onCookieChangedDebounceTimer = null;
+    getAwsAppsCookies()
+      .then((cookies) => sendNative({ action: 'syncOpenProfiles', cookies: serializeCookiesForHost(cookies) }))
+      .then((response) => {
+        if (response && response.ok) {
+          log('cookies.onChanged: pushed fresh .awsapps.com cookie set ->', response.synced, 'open profile(s)');
+        } else {
+          log('cookies.onChanged: native host reported failure (non-fatal):', response && response.error);
+        }
+      })
+      .catch((err) => log('cookies.onChanged: push failed (non-fatal):', err.message));
+  }, 500);
+});
+
 async function addRecentLoginEntryToStorage(link, account_name, account_id, role_name, openIn) {
   const href = link.split('&destination')[0];
   const { recentfivelogins: storedEntries } = await chrome.storage.local.get('recentfivelogins');
@@ -304,7 +344,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case 'openAccountRole': {
-          const { link, account_id, account_name, role_name, openIn } = message;
+          const { link, account_id, account_name, role_name, openIn, portalBaseUrl } = message;
           const profileKey = makeProfileKey(account_id, account_name, role_name);
           const displayLabel = `${account_id} | ${account_name} | ${role_name}`;
 
@@ -324,7 +364,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // accountId/roleName ride along here too, separately from displayLabel's own
           // concatenated string, purely so the native host can hand them straight back in a
           // LATER unsolicited 'serviceVisited' push (see RegisterProfileWindowAsync's doc
-          // comment) without having to re-parse them out of displayLabel itself.
+          // comment) without having to re-parse them out of displayLabel itself. portalBaseUrl
+          // rides along for the same reason, but for a different later use: rebuilding a
+          // fresh federation link entirely host-side for the injected banner's "Refresh and
+          // sign in" button - see ProfileWindowIdentity.PortalBaseUrl's own doc comment.
           const response = await sendNative({
             action: 'syncAndOpen',
             profileKey,
@@ -335,6 +378,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             url: link,
             openIn: openIn || 'Window',
             cookies,
+            portalBaseUrl,
           });
 
           if (!response || response.ok !== true) {
@@ -350,6 +394,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const cookies = serializeCookiesForHost(await getAwsAppsCookies());
           const response = await sendNative({ action: 'syncAllProfiles', cookies });
           sendResponse({ ok: !!(response && response.ok) });
+          break;
+        }
+
+        case 'syncCookiesToOpenProfiles': {
+          // The non-disruptive counterpart to copyCookiesToAllProfiles above - fired
+          // automatically by content.js on every portal page load (see its own comment at
+          // that call site), not an explicit user action, so it must never visibly open or
+          // close anything. 'syncOpenProfiles' on the host side only touches a profile that
+          // already has a window open right now, reusing an existing tab's CDP connection -
+          // see CdpClient.SyncCookiesToOpenProfileWindowsAsync's doc comment for the full
+          // reasoning, including why copyCookiesToAllProfiles/syncAllProfiles itself was
+          // never safe to call automatically like this.
+          const cookies = serializeCookiesForHost(await getAwsAppsCookies());
+          const response = await sendNative({ action: 'syncOpenProfiles', cookies });
+          if (!response || response.ok !== true) {
+            log('syncCookiesToOpenProfiles: native host reported failure (non-fatal):', response && response.error);
+          } else {
+            log('syncCookiesToOpenProfiles: synced', response.synced, 'open profile(s)');
+          }
+          sendResponse({ ok: !!(response && response.ok), synced: response && response.synced });
           break;
         }
 

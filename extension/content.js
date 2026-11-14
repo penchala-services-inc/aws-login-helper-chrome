@@ -391,6 +391,17 @@ function extractLoginLinksAndAddTabAndWindowUrls() {
             role_name,
             account_id,
             account_name,
+            // The portal's own origin+path (e.g. "https://foc-sso.awsapps.com/start/"), with
+            // no hash route on it - window.location.href.split('#')[0], same base
+            // account_role_url itself was just resolved against above. Recorded once per
+            // profile window (see CdpClient.RegisterProfileWindowAsync/ProfileWindowIdentity.
+            // PortalBaseUrl) so the native host can rebuild a fresh "#/console?account_id=...
+            // &role_name=...&destination=..." federation link entirely on its own later,
+            // without the extension's help - needed for the "Refresh and sign in" button the
+            // injected banner shows once a window's session has actually expired (see
+            // BuildConsoleBannerScript's own doc comment for why that button can't just call
+            // back into this extension directly).
+            portalBaseUrl: window.location.href.split('#')[0],
           });
         });
         return a;
@@ -543,7 +554,7 @@ function renderPortalSessionExpiry() {
 // rejects (host process failed to start) either way if the companion app isn't there.
 let companionAppDialogShown = false;
 
-function showCompanionAppMissingDialog() {
+function showCompanionAppDialog(titleText, messageText) {
   if (companionAppDialogShown || document.getElementById('awslh-companion-app-dialog')) return;
   companionAppDialogShown = true;
 
@@ -557,16 +568,12 @@ function showCompanionAppMissingDialog() {
     'border-radius:6px;box-shadow:0 4px 24px rgba(0,0,0,0.35);text-align:left;';
 
   const title = document.createElement('div');
-  title.textContent = 'AWS Login Helper companion app not found';
+  title.textContent = titleText;
   title.style.cssText = 'font-size:16px;font-weight:bold;margin-bottom:10px;';
   box.appendChild(title);
 
   const message = document.createElement('div');
-  message.textContent =
-    "Opening an account/role in its own isolated window needs a small companion app " +
-    "installed on this computer, and it doesn't look like it's running right now. Open the " +
-    "setup instructions to install it for your operating system (Windows or macOS), then " +
-    'reload this page.';
+  message.textContent = messageText;
   message.style.cssText = 'font-size:13px;margin-bottom:16px;line-height:1.4;';
   box.appendChild(message);
 
@@ -599,11 +606,61 @@ function showCompanionAppMissingDialog() {
   document.body.appendChild(overlay);
 }
 
+function showCompanionAppMissingDialog() {
+  showCompanionAppDialog(
+    'AWS Login Helper companion app not found',
+    "Opening an account/role in its own isolated window needs a small companion app " +
+      "installed on this computer, and it doesn't look like it's running right now. Open the " +
+      "setup instructions to install it for your operating system (Windows or macOS), then " +
+      'reload this page.'
+  );
+}
+
+// The extension and companion app are released together under one version number (see
+// CLAUDE.md "Versioning"), so anything other than an exact match means one of them is stale and
+// the extension won't work properly. A companion too old to report a version at all counts as a
+// mismatch too. Opens the welcome page on its own the first time a given extension/companion
+// version pair is seen (remembered in storage so every portal page load doesn't spawn a new
+// tab), and the dialog's button can always reopen it.
+function showCompanionAppVersionMismatchDialog(extensionVersion, companionVersion) {
+  const isMac = /Mac/i.test(navigator.platform || navigator.userAgent || '');
+  const howToUpdate = isMac
+    ? 'On macOS you may need to download the latest companion app files (the jars) and follow ' +
+      'the install instructions again.'
+    : 'On Windows you will need to uninstall the AWS Login Helper companion app (Settings > ' +
+      'Apps > Installed apps), then reinstall the latest version.';
+  showCompanionAppDialog(
+    'AWS Login Helper companion app is out of date',
+    `This extension is version ${extensionVersion}, but the companion app is ` +
+      `${companionVersion ? 'version ' + companionVersion : 'an older version'}. Get the latest ` +
+      'version of the companion app, otherwise the extension will not work properly. ' +
+      howToUpdate + ' Open the setup instructions for details, then reload this page.'
+  );
+
+  const seenKey = 'companionVersionMismatchSeen';
+  const pair = `${extensionVersion}|${companionVersion || ''}`;
+  try {
+    chrome.storage.local.get(seenKey, (items) => {
+      if (chrome.runtime.lastError || (items && items[seenKey] === pair)) return;
+      chrome.storage.local.set({ [seenKey]: pair });
+      chrome.runtime.sendMessage({ action: 'openWelcomePage' });
+    });
+  } catch (e) {
+    log('Could not record companion version mismatch:', e);
+  }
+}
+
 function checkCompanionAppInstalled() {
   chrome.runtime.sendMessage({ action: 'checkNativeHost' }, (response) => {
     if (chrome.runtime.lastError || !response || response.ok !== true) {
       log('Companion app check failed:', chrome.runtime.lastError || (response && response.error));
       showCompanionAppMissingDialog();
+      return;
+    }
+    const extensionVersion = chrome.runtime.getManifest().version;
+    if (response.version !== extensionVersion) {
+      log('Companion app version mismatch: extension', extensionVersion, 'companion', response.version);
+      showCompanionAppVersionMismatchDialog(extensionVersion, response.version);
     }
   });
 }
@@ -640,15 +697,20 @@ if (
 
   checkCompanionAppInstalled();
 
-  // NOTE: this used to also fire a background 'copyCookiesToAllProfiles' resync here on
-  // every portal page load, mirroring the Firefox extension's copyCookiesToAllContainers.
-  // Removed: it loops through every isolated profile ever created and briefly opens a
-  // window/tab in each one just to refresh its cookie, which - once more than a couple of
-  // profiles exist - looks like a burst of blank Chrome windows opening and closing on every
-  // reload. Cookies already get freshly synced at the moment a profile is actually opened
-  // (see 'openAccountRole' below), so this wasn't load-bearing, just disruptive. Revisit as
-  // an opt-in "sync all" button in the popup instead, if the background refresh turns out to
-  // be worth the disruption for someone.
+  // Lets an isolated window the user ALREADY has open be refreshed by hand after signing
+  // back into the portal (e.g. the IIC/SSO session had expired) without forcing a full
+  // re-auth in that window too. This used to fire the background 'copyCookiesToAllProfiles'
+  // resync here instead, mirroring the Firefox extension's copyCookiesToAllContainers, and
+  // was REMOVED for being disruptive: that path loops through every isolated profile ever
+  // created on disk and briefly opens a window/tab in each one just to refresh its cookie,
+  // which - once more than a couple of profiles exist - looked like a burst of blank Chrome
+  // windows opening and closing on every portal page load. 'syncCookiesToOpenProfiles' is
+  // the narrower replacement: the native host only touches a profile that already has a
+  // window open RIGHT NOW, reusing one of its existing tabs' CDP connection, so nothing new
+  // ever opens or closes - see CdpClient.SyncCookiesToOpenProfileWindowsAsync's own doc
+  // comment on the host side for the full reasoning. Function name is historical (originally
+  // written just for 'openAccountRole'); it works for any payload.
+  sendOpenAccountRoleMessage({ action: 'syncCookiesToOpenProfiles' });
 }
 
 // ---------------------------------------------------------------------------

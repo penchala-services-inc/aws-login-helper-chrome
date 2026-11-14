@@ -560,7 +560,7 @@ namespace AwsLoginHelperHost
             }
         }
 
-        private async Task<List<(string Id, string Url)>> WaitForAtLeastOneTargetAsync(int port)
+        private async Task<List<(string Id, string Url, string Title)>> WaitForAtLeastOneTargetAsync(int port)
         {
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
             while (DateTime.UtcNow < deadline)

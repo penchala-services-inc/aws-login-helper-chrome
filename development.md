@@ -159,6 +159,150 @@ Session expiry is shown in two places, both cookie-driven: the portal page
 (the native host, reading the `aws-creds` cookie over the same CDP
 connection right after the sync).
 
+### Keeping already-open isolated windows refreshable
+
+Cookies normally only get copied into a profile the moment someone clicks
+its "Isolated (Window)" link. If the portal's own IIC/SSO session later
+expires and the person signs back in, every isolated window they already
+had open is still holding that original, now-stale cookie - refreshing one
+of those windows (F5) would fail AWS's own silent session-refresh redirect
+instead of picking up the new session, since nothing ever told that
+profile's cookie jar about it.
+
+`content.js` fixes this by firing `syncCookiesToOpenProfiles` to
+`background.js` every time the portal page finishes loading, which reads
+the current `.awsapps.com` cookies and sends them to the native host as
+`syncOpenProfiles`. `CdpClient.SyncCookiesToOpenProfileWindowsAsync` pushes
+them into every profile that currently has a window open - and ONLY those -
+by reusing one of that window's own already-open CDP targets
+(`Network.setCookie`, no navigation, no banner, no window focus). Nothing
+new ever opens or closes.
+
+This is deliberately narrower than the older `syncAllProfiles` native
+action (`Program.HandleSyncAllProfiles`, wired to `background.js`'s
+`copyCookiesToAllProfiles`), which loops through every profile directory
+ever created on disk and briefly opens/closes a tab in each just to set its
+cookie - fine for an explicit, occasional "sync all" action, but it used to
+also fire automatically on every portal page load (mirroring the Firefox
+extension's `copyCookiesToAllContainers`) and was reverted for exactly that
+reason: once more than a couple of profiles exist, it looked like a burst
+of blank Chrome windows opening and closing on every reload. That old path
+is still there, just not called automatically.
+
+**Why this didn't actually work until v1.0.5.** The windowId -> account/
+role mapping this all depends on (`CdpClient._profileWindows`) is recorded
+once, when `RegisterProfileWindowAsync` first opens or forwards into a
+profile's window, and lives only in that native host process's own memory.
+That process does NOT reliably live as long as the browser windows it's
+tracking do: `background.js` keeps its single `chrome.runtime.connectNative`
+connection open only for as long as the extension's own background service
+worker is alive, and a periodic keepalive ping (`getNativePort`/
+`ensureKeepAlive`) only staves off that connection dying for as long as
+something keeps scheduling it - a browser restart, an extension
+reload/update, or any other gap where the service worker fully unloads all
+kill the native host process and wipe this map clean, even though the
+dedicated Chrome instance and every isolated window it owns keep right on
+running the whole time. A window left open long enough to actually have its
+session expire has almost always outlived the process that originally
+registered it, so `SyncCookiesToOpenProfileWindowsAsync` found nothing in
+`_profileWindows` to iterate over and silently synced zero profiles -
+confirmed by testing (debug-logging the host showed a `syncOpenProfiles`
+request completing in a few ms with no per-profile log line at all) and by
+navigating straight to the isolated window's own federation link by hand,
+which still asked to sign in because the cookie had genuinely never
+arrived.
+
+Fixed by also persisting `_profileWindows` to `profile-windows.json` (same
+root folder as `cdp-port.txt`/`profile-labels.json`) every time
+`RegisterProfileWindowAsync` records a window, and having
+`SyncCookiesToOpenProfileWindowsAsync` call
+`ReconcileProfileWindowsFromDiskAsync` first: it asks the dedicated
+instance which windowIds are ACTUALLY open right now (resolving each
+current CDP target's window, same `Browser.getWindowForTarget` call
+`RegisterProfileWindowAsync` itself uses), then pulls a matching identity
+back in from disk for any of those confirmed-live windowIds this process
+doesn't already know about. A disk entry is only ever revived if a live CDP
+check just confirmed its windowId is genuinely still open right now, so a
+stale entry for a long-closed window (or a same-numbered window in some
+later, fully-restarted dedicated instance) can never be wrongly revived.
+
+### Noting AWS's own "You have been signed out" modal
+
+If the IIC/SSO session expires while someone is sitting in an isolated
+console window, AWS's own frontend shows its own real-time "You have been
+signed out" modal there, with a "Sign in again" button. Clicking that button
+re-authenticates DIRECTLY in that isolated profile - bypassing the portal
+page entirely, which means re-entering MFA right there instead of getting
+the one-click refresh this extension exists to provide.
+
+`CdpClient.BuildConsoleBannerScript`'s injected script already polls a
+countdown (`updateExpiryText`, driven by the `aws-creds` cookie's expiry).
+Once that countdown reaches zero, it also checks the page for AWS's modal -
+matched by its visible heading text ("you have been signed out"), not its
+css-module class names (those are a build-time hash baked in by AWS's own
+frontend tooling and can change on any console deploy with no notice; the
+English copy it shows the user is far more stable to depend on). If the
+modal is showing, a banner is added pinned to the very top of the viewport
+(above the modal's own backdrop, via the same max z-index the account/role
+banner uses) telling the user not to click "Sign in again" there. The check
+only fires once our own countdown has also hit zero, so a transient false
+match on the modal's text can't trigger it early, and it's a no-op if the
+note is already showing (keyed by its own element id), consistent with every
+other piece of the injected script being safe to run more than once against
+the same still-open page.
+
+**Why F5-after-portal-reauth (v1.0.4/v1.0.5) wasn't enough, and what v1.0.6
+changed.** The original note told the user to re-auth on the portal page,
+then come back and refresh (F5) - reasoning that `syncCookiesToOpenProfiles`
+would have just pushed a fresh `.awsapps.com` cookie into this profile,
+so the refresh would pick up the new session. In practice this still failed:
+a plain F5 of an already-expired console URL never invokes AWS's SSO
+federation flow at all (confirmed by testing - AWS just redirects to a
+generic sign-in page regardless of cookie freshness), and even manually
+navigating straight to the account/role's federation URL with a
+confirmed-fresh synced cookie still failed. A side-by-side DevTools cookie
+comparison (a working, freshly-opened window vs. this same window after
+expiry + portal reauth) explained why: the expired window's
+`console.aws.amazon.com`-domain cookie jar was missing `aws-creds` (the
+real session cookie) entirely, but still full of OTHER long-lived
+console-side cookies left over from the original sign-in (`aws-userInfo`,
+`aws-userInfo-signed`, `last-sign-in-session`, `awsc-rac`, the `noflush_*`
+family, and others) - these never expire on their own inside this
+long-running dedicated instance, and were found to conflict with a fresh
+federation attempt, causing AWS's backend to reject it and bounce back to
+"session expired" instead of minting a new `aws-creds`.
+
+v1.0.6 fixes this with no F5 and no portal round-trip required from the
+user beyond re-authenticating there once: the moment `checkForSignedOutNote`
+first shows the note (same idempotency guard as before), the injected script
+also sets `document.title` to a one-shot marker
+(`CdpClient.SignedOutTitleMarkerPrefix`) - the only channel available at all
+from page JS running in this dedicated, extension-less instance, since no
+extension is loaded into it for `chrome.runtime.sendMessage` to reach.
+`RunInstanceWatcherLoopAsync`'s existing 1.5s poll of `/json/list` already
+reads each target's title; seeing that marker (matched with `Contains`, not
+`StartsWith`, since `ensureTitle()` may re-prepend the account/role title
+prefix on top of it before the next poll tick) triggers
+`CdpClient.ClearStaleSessionCookiesAsync` exactly once - a brief CDP
+connect/`Network.clearBrowserCookies`/disconnect against just that profile's
+own window, clearing every one of those stale leftover cookies. The note
+itself now also shows a plain `<a href>` straight to the federation URL,
+rebuilt entirely host-side from the portal origin+path, account id, and role
+name that were captured once, when the window was first opened
+(`content.js`'s `portalBaseUrl` capture -> `background.js` ->
+`Program.cs`'s `HandleSyncAndOpen` -> `CdpClient.ProfileWindowIdentity.
+PortalBaseUrl`, persisted to `profile-windows.json` alongside everything
+else `RegisterProfileWindowAsync` already persists). Clicking that link is
+an ordinary top-level navigation - no click handler, no JS action from this
+extension at all - that now succeeds because by the time the user clicks,
+the stale cookies are already gone (cleared above) and a fresh
+`.awsapps.com` cookie has already landed too, via the existing automatic
+`syncCookiesToOpenProfiles` the next time the portal page reloads - exactly
+the same cookie state a freshly-opened profile would have. A window opened
+before this field existed has nothing to rebuild a link from
+(`PortalBaseUrl` empty) and still gets the old plain-text "go to the portal
+and press F5" guidance as a fallback.
+
 ### Multiple isolated profiles
 
 Each account/role's dedicated Chrome profile can be listed and deleted from

@@ -23,7 +23,7 @@ namespace AwsLoginHelperHost
     /// </summary>
     public static class Program
     {
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.3";
 
         public static int Main(string[] args)
         {
@@ -240,6 +240,9 @@ namespace AwsLoginHelperHost
                 case "syncAllProfiles":
                     return await HandleSyncAllProfiles(chrome, request);
 
+                case "syncOpenProfiles":
+                    return await HandleSyncOpenProfiles(chrome, request);
+
                 case "listProfiles":
                     return HandleListProfiles(chrome);
 
@@ -307,6 +310,15 @@ namespace AwsLoginHelperHost
             // watcher loop.
             string accountId = (string)request["accountId"] ?? string.Empty;
             string roleName = (string)request["roleName"] ?? string.Empty;
+            // The portal's own origin+path (e.g. "https://foc-sso.awsapps.com/start/"), with
+            // no hash route on it - see content.js's own doc comment on where this comes from.
+            // Stored on the window's identity purely so a MUCH later action - the injected
+            // banner's "Refresh and sign in" button, see BuildConsoleBannerScript - can have
+            // CdpClient rebuild a fresh federation link entirely host-side, long after this
+            // request has finished and without needing the extension's help again. Falls back
+            // to "" (never null) so an older extension build that doesn't send it yet just
+            // means that button can't be built for this window - not a crash.
+            string portalBaseUrl = (string)request["portalBaseUrl"] ?? string.Empty;
             string url = (string)request["url"];
             var cookies = ParseCookies(request);
 
@@ -318,7 +330,7 @@ namespace AwsLoginHelperHost
             chrome.RecordProfileLabel(profileKey, displayLabel);
 
             var (wsUrl, port, targetId) = await chrome.EnsureTabForProfileAsync(profileKey);
-            await chrome.Cdp.SetCookiesAndNavigateAsync(wsUrl, cookies, url, displayLabel, titleLabel);
+            await chrome.Cdp.SetCookiesAndNavigateAsync(wsUrl, cookies, url, displayLabel, titleLabel, accountId, roleName, portalBaseUrl);
 
             // Covers every LATER full navigation (or brand new tab - see that method's own doc
             // comment) within this profile's window - SetCookiesAndNavigateAsync above only
@@ -338,7 +350,7 @@ namespace AwsLoginHelperHost
                 Logger.LogError($"HandleSyncAndOpen: failed to read settled url before registering the profile window (non-fatal) - {ex}");
             }
             await chrome.Cdp.RegisterProfileWindowAsync(
-                port, targetId, stdout, profileKey, accountId, titleLabel, roleName, displayLabel, titleLabel, settledUrl);
+                port, targetId, stdout, profileKey, accountId, titleLabel, roleName, displayLabel, titleLabel, settledUrl, portalBaseUrl);
 
             return new JObject { ["ok"] = true, ["profileKey"] = profileKey };
         }
@@ -365,6 +377,28 @@ namespace AwsLoginHelperHost
             }
 
             return new JObject { ["ok"] = true, ["synced"] = synced, ["errors"] = errors };
+        }
+
+        /// <summary>
+        /// The non-disruptive counterpart to HandleSyncAllProfiles above - only syncs profiles
+        /// that already have a window open RIGHT NOW (see
+        /// CdpClient.SyncCookiesToOpenProfileWindowsAsync's own doc comment for exactly why),
+        /// so it's safe to call on every portal page load instead of needing to be an explicit,
+        /// occasional "sync all" action. If the dedicated instance isn't even running, there
+        /// are no open isolated windows at all, so there's nothing to do - not an error.
+        /// </summary>
+        private static async Task<JObject> HandleSyncOpenProfiles(ChromeManager chrome, JObject request)
+        {
+            var cookies = ParseCookies(request);
+
+            int? port = await chrome.TryGetActivePortAsync();
+            if (port == null)
+            {
+                return new JObject { ["ok"] = true, ["synced"] = 0 };
+            }
+
+            int synced = await chrome.Cdp.SyncCookiesToOpenProfileWindowsAsync(port.Value, cookies);
+            return new JObject { ["ok"] = true, ["synced"] = synced };
         }
 
         private static JObject HandleListProfiles(ChromeManager chrome)
